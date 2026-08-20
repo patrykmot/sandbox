@@ -20,6 +20,7 @@ Whole idea is to catch multiple different objects (and they relations) at same t
 * Language: Python 3.12 (Use modern type hinting, typing.Protocol or abc.ABC, dataclasses, and native asyncio/threading where applicable).
 * Architecture Design: Interface-driven design (Strategy Pattern). Components 1, 2, 3, 5 AND 6 MUST be defined via strict Abstract Base Classes (ABCs) or Protocols to allow seamless swapping of implementations.
 * Dependencies: opencv-python, ultralytics, scikit-learn, fastapi, uvicorn, numpy, pydantic, pydantic-settings.
+ Testing: Write JUNIT tests where feasible (test will be easy to maintain, and fast to launch). Use mocking so no camera is needed to run it.
 
 ---
 
