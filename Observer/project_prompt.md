@@ -1,32 +1,46 @@
-# PROMPT: Modular Edge Video Anomaly Detection System
+PROMPT: Modular Edge Video Anomaly Detection System
 
+---
+---
+---
+
+**General Note:** If you see something is unclear or brake logical rules so you cant figure it out, just ask me for question. 
+
+# Phase I
 ## Objective
 Act as a Principal Python Software Engineer. Write a modular, production-ready, clean, and well-typed Python 3.14 application for real-time video anomaly detection on edge devices.
-The system converts video streams into low-dimensional mathematical vectors (position 2D, size 1D, object type 1D) and feeds them into an unsupervised machine learning model (Isolation Forest) to detect temporal/spatial anomalies.
+The system converts video streams into mathematical vectors called StateVector (timestamp in milliseconds, position 2D, speed 2d, size 1D, object type 1D) 
+Next, StateVector list is passed to featureEncoder to get FeatureVector list. FeatureVector is vector with floats N sized and timestamp for which this feature happened. Implementation of featureEncoder will be done in Phase II.
+Whole idea is to catch multiple different objects (and they relations) at same time, and find anomaly for it later when training is finished.
+
 
 ---
 
 ## Technical Guidelines & Constraints
-* Language: Python 3.14 (Use modern type hinting, typing.Protocol or abc.ABC, dataclasses, and native asyncio/threading where applicable).
-* Architecture Design: Interface-driven design (Strategy Pattern). Components 1, 2, 3, and 5 MUST be defined via strict Abstract Base Classes (ABCs) or Protocols to allow seamless swapping of implementations.
+* Language: Python 3.12 (Use modern type hinting, typing.Protocol or abc.ABC, dataclasses, and native asyncio/threading where applicable).
+* Architecture Design: Interface-driven design (Strategy Pattern). Components 1, 2, 3, 5 AND 6 MUST be defined via strict Abstract Base Classes (ABCs) or Protocols to allow seamless swapping of implementations.
 * Dependencies: opencv-python, ultralytics, scikit-learn, fastapi, uvicorn, numpy, pydantic, pydantic-settings.
 
 ---
 
 ## System Architecture & Data Flow
 
- [ 1. Video Source ] ──> (Frame) ──> [ 2. Video Encoder ]
+[ 1. Video Source ] ──> (Frame) ──> [ 2. Video Encoder ]
                                              │
-                                       (Vector [X,Y,S,T])
+                                   (list[StateVector])
+                                             ▼
+                                   [ 6. Feature Encoder ]
                                              │
+                                  (list[FeatureVector])
                                              ▼
  [ 5. Alarm Handler ] <── (Alarm) ── [ 4. Supervisor ] <──> [ 3. AI Detector ]
           │                                  │
-          └──────────── [ 6. Web Dashboard ] ◄┘
+          └─────────── [ Phase II Web UI ] ◄─┘
+          
 
 ---
 
-## A. Component Specifications & Interfaces (1,2,3,5)
+## A. Component Specifications & Interfaces (1,2,3,5,6) - Those are domains of application.
 
 ### Interface 1: Video Data Source (IVideoSource)
 Abstract interface to stream frames from hardware or software sources.
@@ -40,28 +54,31 @@ Abstract interface to stream frames from hardware or software sources.
 ### Interface 2: Video Encoder (IVideoEncoder)
 Abstract interface to extract features from frames and convert them into low-dimensional vectors.
 * Data Structure:
-  - ObjectVector: Data class containing:
+  - StateVector: Data class containing:
+    - t: timestamp in milliseconds ( Unix epoch timestamp in milliseconds, UTC), just to know when this state happened, and it can be passed to FeatureVector
     - x: float (2D Center X)
     - y: float (2D Center Y)
-    - size: float (1D Area or Bounding Box Scale)
+    - Vx: float speed on X (pixels change / second)
+    - Vy: float speed on Y (pixels change / second)
+    - size: float: bounding box surface area
     - object_type: int (1D Class ID, e.g., 0 for Person)
-    - to_array() -> list[float]: Returns numeric 1D list [x, y, size, object_type].
 * Methods:
-  - encode(frame: np.ndarray) -> list[ObjectVector]: Processes frame and outputs detected object vectors.
+  - encode(frame: np.ndarray) -> list[StateVector]: Processes frame and outputs detected object vectors.
 * Implementation 1 (YOLOVideoEncoder):
   - Uses Ultralytics YOLO (yolov8n.pt) to detect objects.
-  - Maps bounding boxes [x_center, y_center, width * height, class_id] to ObjectVector.
+  - Maps outcome of detection to StateVector. Base on tracking id calculate speed vector (Vx,Vy) as well. Please use ByteTrack for tracking. 
 
 ### Interface 3: Anomaly Detector (IAnomalyDetector)
 Abstract interface for training and predicting anomalies from vectors.
 * Methods:
-  - fit(training_data: list[list[float]]) -> None: Trains the underlying model on collected vectors.
-  - predict(vector: list[float]) -> tuple[bool, float]: Returns (is_anomaly, anomaly_score).
+  - fit(training_data: list[list[FeatureVector]]) -> None: Trains the underlying model on collected vectors.
+  - predict(vector: list[FeatureVector]) -> tuple[bool, float]: Returns (is_anomaly, anomaly_score).
   - is_trained() -> bool: Returns model status.
   - save(path: str) -> None / load(path: str) -> None: Persistence methods.
 * Implementation 1 (IsolationForestAnomalyDetector):
   - Uses sklearn.ensemble.IsolationForest.
   - Configurable contamination parameter (e.g., 0.05).
+  - One Isolation Forest for the entire data.
 
 ### Interface 5: Alarm Handler (IAlarmHandler)
 Abstract interface to dispatch notifications when an anomaly is detected.
@@ -73,16 +90,26 @@ Abstract interface to dispatch notifications when an anomaly is detected.
   - Logs the alarm with high visual visibility to stdout/stderr.
   - Stores recent alarm history in memory for Web UI access.
 
+### Interface 6: Feature Encoder (IFeatureEncoder)
+Abstract interface to that maps from StateVector into FeatureVector
+* Data Structure: 
+  - FeatureVector: Data class containing 
+    - t - same as StateVector.t
+    - vector - contain N float features (which describe vector values)
+* Methods:
+  - encode(list[StateVector]) -> list[FeatureVector]: Process StateVector and produce  FeatureVector that could be used to train or feed ML model to detect anomalies. Outcome list size do not need to be same as income list.
+* In Phase I implementation is empty. Will be added in Phase II. For now you can just add DummyFeatureEncoder.
+
 ---
 
-## B. Separated description for Component 4: System Supervisor (Supervisor)
+## B. Separated description for Component 4: System Supervisor (Supervisor) - Application itself
 
 The Coordinator that manages lifecycle, state machine transitions, and component execution loops.
 
 ### State Machine States:
 1. INITIALIZING: Setting up sources and models.
-2. COLLECTING_DATA: Accumulating normal baseline vectors for N days (or N frames/samples for testing).
-3. TRAINING: Triggers model training when data requirement is reached.
+2. COLLECTING_DATA: Accumulating normal baseline vectors for N days (or N frames/samples for testing). The collection phase assumes that the environment is known to be normal. No anomaly detection is performed during collection.
+3. TRAINING: Triggers model training when data requirement is reached. This is global model training with all collected training data.
 4. MONITORING: Active execution phase. Feeds live encoded vectors to the model.
 5. ALARM_ACTIVE: Triggered when predict() flags an anomaly. Invokes IAlarmHandler.trigger_alarm().
 6. ERROR: Fault state.
@@ -90,36 +117,16 @@ The Coordinator that manages lifecycle, state machine transitions, and component
 ### Core Loop Logic:
 1. Read frame from IVideoSource.
 2. Extract vectors via IVideoEncoder.
-3. Depending on state:
+3. Extract features via IFeatureEncoder.
+4. Depending on state:
    - If COLLECTING_DATA: Append vectors to training dataset. Track collection progress (e.g., % complete).
    - If collection target reached: Transition to TRAINING -> call IAnomalyDetector.fit() -> transition to MONITORING.
    - If MONITORING: Pass vectors to IAnomalyDetector.predict(). If is_anomaly == True, state transitions momentarily or concurrently triggers IAlarmHandler.
-4. Expose current frame, system stats, current state, and logs to the Web Dashboard.
+
 
 ### Thread-Safety & Data Sharing Constraint:
 * Use a thread-safe mechanism (e.g., `threading.Lock` combined with a shared instance variable, or an `asyncio.Queue`) to safely pass the latest annotated frame and system state from the Supervisor loop to the Web Server for the MJPEG stream.
 
----
-
-## C. Web Dashboard & HTTP Server (WebDashboard)
-
-A lightweight FastAPI web server running concurrently with the processing loop.
-
-### Strict Concurrency Requirement:
-* The OpenCV/Supervisor processing loop MUST run in a separate background `threading.Thread` to prevent blocking the asynchronous FastAPI event loop.
-
-* Features:
-  - Simple HTML/JS dashboard embedded or served via single file.
-  - Live View: Displays live processed camera feed (MJPEG stream endpoint).
-  - System State Indicator: Shows current state (COLLECTING_DATA, MONITORING, ALARM, etc.).
-  - Progress Bar: Shows data collection progress during Phase 1.
-  - Alarm Log: Table displaying recent alarm events with timestamps and vector values.
-* Endpoints:
-  - GET /: UI Web page.
-  - GET /api/status: Returns JSON with state, processed frame count, collection progress %, total alarms.
-  - GET /video_feed: MJPEG stream endpoint for real-time visualization.
-
----
 
 ## D. Suggested Directory Architecture
 
@@ -130,7 +137,7 @@ src/
 ├── interfaces/
 │   ├── __init__.py
 │   ├── video_source.py       # IVideoSource
-│   ├── encoder.py            # IVideoEncoder & ObjectVector
+│   ├── encoder.py            # IVideoEncoder & StateVector + IFeatureEncoder & FeatureVector
 │   ├── detector.py           # IAnomalyDetector
 │   └── alarm.py              # IAlarmHandler & AlarmEvent
 ├── implementations/
@@ -142,11 +149,6 @@ src/
 ├── core/
 │   ├── __init__.py
 │   └── supervisor.py         # Supervisor (State Machine Logic)
-├── web/
-│   ├── __init__.py
-│   └── server.py             # FastAPI App & MJPEG Streamer
-├── templates/
-│   └── index.html            # Web Dashboard Frontend
 └── main.py                   # Entry point (CLI & Startup)
 
 ---
@@ -154,16 +156,18 @@ src/
 ## 5. Configuration Requirements (config.py)
 
 Provide a single configuration file supporting environment variables or CLI overrides using `pydantic-settings`:
-* COLLECTION_DURATION_MODE: "DAYS" or "FRAMES" (default "FRAMES" with 1000 samples for quick test/demo).
-* COLLECTION_TARGET_VALUE: Numerical target (e.g., 3 days or 5000 vectors).
+* COLLECTION_TARGET_VALUE: Numerical target 1000 vectors.
 * CAMERA_INDEX: 0 or RTSP string.
-* MODEL_CONTAM_RATE: 0.05
 * SERVER_HOST: "0.0.0.0"
 * SERVER_PORT: 8000
 
 ---
 
 ## 6. Execution Requirements
-1. Provide a main.py script that instantiates default implementations, passes them to Supervisor, starts the background Web Server, and runs the application.
+1. Provide a main.py script that instantiates default implementations, passes them to Supervisor, and runs the application.
 2. Provide a clean requirements.txt.
 3. Include inline comments explaining interface decoupling so new hardware/software components can be plugged in by swapping implementation classes in main.py.
+
+---
+---
+---
