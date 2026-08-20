@@ -1,0 +1,76 @@
+"""Entry point: wires the default implementations into the Supervisor and runs it.
+
+To swap any component for a different implementation (e.g. a video-file
+source instead of a live camera, or a different anomaly detector), only the
+imports and constructor calls below need to change - every other module
+depends solely on the interfaces in src/interfaces/, so nothing else in the
+system needs to know.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from src.config import Config
+from src.core.supervisor import Supervisor
+from src.implementations.camera_source import CameraVideoSource
+from src.implementations.console_alarm import ConsoleLoggerAlarmHandler
+from src.implementations.dummy_feature_encoder import DummyFeatureEncoder
+from src.implementations.iso_forest_detector import IsolationForestAnomalyDetector
+from src.implementations.yolo_encoder import YOLOVideoEncoder
+
+
+def build_supervisor(config: Config) -> Supervisor:
+    # Component 1: Video Data Source. Swap for e.g. a VideoFileSource by
+    # changing this single line.
+    video_source = CameraVideoSource(camera_index=config.camera_index)
+
+    # Component 2: Video Encoder. Swap for another detector/tracker backend
+    # by implementing IVideoEncoder and constructing it here instead.
+    video_encoder = YOLOVideoEncoder(
+        model_path=config.yolo_model_path,
+        confidence=config.yolo_confidence,
+        tracker=config.yolo_tracker,
+    )
+
+    # Component 6: Feature Encoder. Phase I placeholder - replace with the
+    # real Phase II implementation by swapping this line.
+    feature_encoder = DummyFeatureEncoder()
+
+    # Component 3: Anomaly Detector.
+    anomaly_detector = IsolationForestAnomalyDetector(
+        contamination=config.isolation_forest_contamination,
+    )
+
+    # Component 5: Alarm Handler. Swap for e.g. an email/SMS/webhook handler
+    # by implementing IAlarmHandler and constructing it here instead.
+    alarm_handler = ConsoleLoggerAlarmHandler()
+
+    return Supervisor(
+        video_source=video_source,
+        video_encoder=video_encoder,
+        feature_encoder=feature_encoder,
+        anomaly_detector=anomaly_detector,
+        alarm_handler=alarm_handler,
+        collection_target_value=config.collection_target_value,
+    )
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    config = Config()
+    supervisor = build_supervisor(config)
+
+    logging.getLogger(__name__).info(
+        "Starting Observer. Collecting %d vectors before training...",
+        config.collection_target_value,
+    )
+    supervisor.run_forever()
+
+
+if __name__ == "__main__":
+    main()

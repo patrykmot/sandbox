@@ -98,6 +98,7 @@ Abstract interface to that maps from StateVector into FeatureVector
     - vector - contain N float features (which describe vector values)
 * Methods:
   - encode(list[StateVector]) -> list[FeatureVector]: Process StateVector and produce  FeatureVector that could be used to train or feed ML model to detect anomalies. Outcome list size do not need to be same as income list.
+* Use Feature Encoder output to feed Anomaly Detector. One vector FeatureVector.vector its one fixed size vector that you should feed isolation forest fit. Of course for predict you need to have list of FeatureVectors.
 * In Phase I implementation is empty. Will be added in Phase II. For now you can just add DummyFeatureEncoder.
 
 ---
