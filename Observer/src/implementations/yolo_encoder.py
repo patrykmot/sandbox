@@ -7,7 +7,7 @@ import time
 import numpy as np
 from ultralytics import YOLO
 
-from src.interfaces.encoder import IVideoEncoder, StateVector
+from src.interfaces.encoder import EncodedFrame, IVideoEncoder, StateVector
 
 
 class YOLOVideoEncoder(IVideoEncoder):
@@ -32,7 +32,7 @@ class YOLOVideoEncoder(IVideoEncoder):
         # track_id -> (x, y, t_ms) of that object's last observed position.
         self._last_seen: dict[int, tuple[float, float, int]] = {}
 
-    def encode(self, frame: np.ndarray) -> list[StateVector]:
+    def encode(self, frame: np.ndarray) -> EncodedFrame:
         now_ms = time.time_ns() // 1_000_000
 
         results = self._model.track(
@@ -45,13 +45,17 @@ class YOLOVideoEncoder(IVideoEncoder):
 
         state_vectors: list[StateVector] = []
         if not results:
-            return state_vectors
+            return EncodedFrame(states=state_vectors, annotated_frame=frame)
+
+        # result.plot() renders boxes/labels/track ids onto a copy of the
+        # frame. Display-only - the ML pipeline never sees this image.
+        annotated_frame = results[0].plot()
 
         boxes = results[0].boxes
         if boxes is None or boxes.id is None:
             # No tracked detections in this frame (nothing above threshold,
             # or ByteTrack hasn't assigned ids yet).
-            return state_vectors
+            return EncodedFrame(states=state_vectors, annotated_frame=annotated_frame)
 
         xywh = boxes.xywh.cpu().numpy()  # center-x, center-y, width, height
         track_ids = boxes.id.cpu().numpy().astype(int)
@@ -87,4 +91,4 @@ class YOLOVideoEncoder(IVideoEncoder):
                 )
             )
 
-        return state_vectors
+        return EncodedFrame(states=state_vectors, annotated_frame=annotated_frame)

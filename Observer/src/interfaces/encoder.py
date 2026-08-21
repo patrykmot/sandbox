@@ -1,7 +1,7 @@
 """Interface 2 & 6: Video Encoder and Feature Encoder.
 
-Data flow: Frame -> [IVideoEncoder] -> list[StateVector] -> [IFeatureEncoder]
--> list[FeatureVector].
+Data flow: Frame -> [IVideoEncoder] -> EncodedFrame(list[StateVector], annotated)
+-> [IFeatureEncoder] -> list[FeatureVector].
 """
 
 from __future__ import annotations
@@ -35,12 +35,33 @@ class StateVector:
     object_type: int
 
 
+@dataclass(frozen=True, slots=True)
+class EncodedFrame:
+    """Everything a single `IVideoEncoder.encode()` call produced.
+
+    Both fields come from the SAME inference pass, which is why they are
+    returned together rather than fetched separately: a later getter could
+    hand back an annotated frame belonging to a different call once the
+    Supervisor loop runs on its own thread.
+
+    Attributes:
+        states: One StateVector per detected/tracked object.
+        annotated_frame: The frame with detection overlays drawn on it, for
+            display purposes only (never fed to the ML pipeline).
+            Implementations with nothing to draw return the input frame
+            unchanged.
+    """
+
+    states: list[StateVector]
+    annotated_frame: np.ndarray
+
+
 class IVideoEncoder(ABC):
     """Abstract interface to extract objects from a frame as StateVectors."""
 
     @abstractmethod
-    def encode(self, frame: np.ndarray) -> list[StateVector]:
-        """Process a single frame and return one StateVector per detected object."""
+    def encode(self, frame: np.ndarray) -> EncodedFrame:
+        """Process a single frame into StateVectors plus a display overlay."""
         raise NotImplementedError
 
 

@@ -46,7 +46,7 @@ class IsolationForestAnomalyDetector(IAnomalyDetector):
         return np.stack([fv.vector for fv in vectors], axis=0)
 
     def fit(self, training_data: list[list[FeatureVector]]) -> None:
-        flattened: list[FeatureVector] = [
+        flattened: list[FeatureVector] = [ #TODO: Is this flatten works as expected?
             fv for frame in training_data for fv in frame
         ]
         if not flattened:
@@ -82,7 +82,7 @@ class IsolationForestAnomalyDetector(IAnomalyDetector):
         return self._model is not None
 
     def save(self, path: str) -> None:
-        if self._model is None:
+        if self._model is None:  #TODO: While save/load should not be state loaded as well?
             raise RuntimeError("Cannot save an untrained IsolationForestAnomalyDetector.")
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         joblib.dump(self._model, path)

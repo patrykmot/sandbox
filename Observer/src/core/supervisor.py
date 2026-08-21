@@ -7,27 +7,25 @@ per-frame execution loop tying every interface-driven component together.
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
-from enum import Enum, auto
 
 import numpy as np
 
 from src.interfaces.alarm import AlarmEvent, IAlarmHandler
+from src.interfaces.controller import IController, SystemStatus
 from src.interfaces.detector import IAnomalyDetector
 from src.interfaces.encoder import FeatureVector, IFeatureEncoder, IVideoEncoder
+from src.interfaces.state import SupervisorState
 from src.interfaces.video_source import IVideoSource
 
 logger = logging.getLogger(__name__)
 
-
-class SupervisorState(Enum):
-    INITIALIZING = auto()
-    COLLECTING_DATA = auto()
-    TRAINING = auto()
-    MONITORING = auto()
-    ALARM_ACTIVE = auto()
-    ERROR = auto()
+# Re-exported so existing `from src.core.supervisor import SupervisorState`
+# imports keep working; the enum itself lives in the interfaces layer so that
+# IController can reference it without depending on core.
+__all__ = ["Supervisor", "SupervisorState"]
 
 
 class Supervisor:
@@ -35,13 +33,13 @@ class Supervisor:
     the system's state machine.
 
     Any implementation of IVideoSource / IVideoEncoder / IFeatureEncoder /
-    IAnomalyDetector / IAlarmHandler can be swapped in via the constructor -
-    the Supervisor only depends on the interfaces.
+    IAnomalyDetector / IAlarmHandler / IController can be swapped in via the
+    constructor - the Supervisor only depends on the interfaces.
 
-    Thread-safety: `latest_frame` and `state` are updated behind a lock so a
-    future Web UI thread (Phase II) can safely read them while `run()` keeps
-    looping in the background. Phase I itself runs `run()` synchronously on
-    the calling thread.
+    Thread-safety: `latest_frame` and `state` are updated behind a lock, and
+    everything an operator UI needs is pushed to the optional IController, so
+    `run_forever()` can be driven from a background thread while a web server
+    serves requests on the main thread.
     """
 
     def __init__(
@@ -52,6 +50,7 @@ class Supervisor:
         anomaly_detector: IAnomalyDetector,
         alarm_handler: IAlarmHandler,
         collection_target_value: int = 1000,
+        controller: IController | None = None,
     ) -> None:
         self._video_source = video_source
         self._video_encoder = video_encoder
@@ -59,15 +58,17 @@ class Supervisor:
         self._anomaly_detector = anomaly_detector
         self._alarm_handler = alarm_handler
         self._collection_target_value = collection_target_value
+        self._controller = controller
 
         self._training_buffer: list[list[FeatureVector]] = []
         self._processed_frame_count = 0
+        self._total_alarms = 0
 
         self._lock = threading.Lock()
         self._state = SupervisorState.INITIALIZING
         self._latest_frame: np.ndarray | None = None
 
-    # --- Public, thread-safe accessors (for a future Web UI) -----------------------
+    # --- Public, thread-safe accessors ------------------------------------------------
 
     @property
     def state(self) -> SupervisorState:
@@ -76,6 +77,7 @@ class Supervisor:
 
     @property
     def latest_frame(self) -> np.ndarray | None:
+        """The most recent annotated frame (detection overlays drawn on)."""
         with self._lock:
             return self._latest_frame
 
@@ -90,6 +92,21 @@ class Supervisor:
     def processed_frame_count(self) -> int:
         return self._processed_frame_count
 
+    @property
+    def total_alarms(self) -> int:
+        return self._total_alarms
+
+    def build_status(self) -> SystemStatus:
+        """Snapshot the Supervisor's public state for the controller/UI."""
+        return SystemStatus(
+            state=self.state,
+            processed_frame_count=self._processed_frame_count,
+            collection_progress=self.collection_progress,
+            collected_count=len(self._training_buffer),
+            collection_target=self._collection_target_value,
+            total_alarms=self._total_alarms,
+        )
+
     def _set_state(self, new_state: SupervisorState) -> None:
         with self._lock:
             if new_state != self._state:
@@ -103,7 +120,11 @@ class Supervisor:
         self._set_state(SupervisorState.COLLECTING_DATA)
 
     def run_forever(self) -> None:
-        """Run the core loop until the video source is exhausted or an error occurs."""
+        """Run the core loop until the video source is exhausted or an error occurs.
+
+        Intended to be run on a background thread when a Controller is
+        serving a UI on the main thread.
+        """
         self.initialize()
         try:
             while True:
@@ -125,20 +146,58 @@ class Supervisor:
             logger.warning("Video source returned no frame; stopping.")
             return False
 
-        with self._lock:
-            self._latest_frame = frame
         self._processed_frame_count += 1
 
         try:
-            states = self._video_encoder.encode(frame)
-            features = self._feature_encoder.encode(states)
+            encoded = self._video_encoder.encode(frame)
+
+            # The annotated frame is what the UI displays; the ML pipeline
+            # only ever sees encoded.states.
+            with self._lock:
+                self._latest_frame = encoded.annotated_frame
+            self._publish_frame(encoded.annotated_frame)
+
+            features = self._feature_encoder.encode(encoded.states)
             self._handle_features(features)
         except Exception:
             logger.exception("Unhandled error while processing frame; entering ERROR state.")
             self._set_state(SupervisorState.ERROR)
+            self._publish_status()
             raise
 
+        self._publish_status()
         return True
+
+    # --- Controller push helpers ------------------------------------------------------
+    #
+    # The Supervisor knows nothing about how (or whether) this data is
+    # displayed - it just hands it to the IController implementation. A
+    # misbehaving UI must never take down the processing loop, so every push
+    # is guarded.
+
+    def _publish_status(self) -> None:
+        if self._controller is None:
+            return
+        try:
+            self._controller.publish_status(self.build_status())
+        except Exception:
+            logger.exception("Controller.publish_status failed; continuing.")
+
+    def _publish_frame(self, annotated_frame: np.ndarray) -> None:
+        if self._controller is None:
+            return
+        try:
+            self._controller.publish_frame(annotated_frame)
+        except Exception:
+            logger.exception("Controller.publish_frame failed; continuing.")
+
+    def _publish_alarm(self, event: AlarmEvent) -> None:
+        if self._controller is None:
+            return
+        try:
+            self._controller.publish_alarm(event)
+        except Exception:
+            logger.exception("Controller.publish_alarm failed; continuing.")
 
     # --- Core state-dependent branching -----------------------------------------------
 
@@ -147,12 +206,9 @@ class Supervisor:
 
         if current_state == SupervisorState.COLLECTING_DATA:
             self._training_buffer.append(features)
-            logger.debug(
-                "Collected frame %d/%d",
-                len(self._training_buffer),
-                self._collection_target_value,
-            )
-            if len(self._training_buffer) >= self._collection_target_value:
+            target_reached = len(self._training_buffer) >= self._collection_target_value
+            self._print_collection_progress(final=target_reached)
+            if target_reached:
                 self._train()
             return
 
@@ -162,8 +218,31 @@ class Supervisor:
 
         # TRAINING / INITIALIZING / ERROR: nothing to do with this frame's features.
 
+    def _print_collection_progress(self, final: bool, bar_width: int = 20) -> None:
+        """Print a single, in-place-updating progress line to the console
+        while COLLECTING_DATA is in progress.
+
+        Uses a bare carriage return (no logging - log lines carry a
+        timestamp/level prefix and start a new one each call) so repeated
+        calls overwrite the same terminal line instead of scrolling. The
+        final call of the collection phase ends with a real newline so the
+        next (logged) TRAINING/MONITORING lines start cleanly.
+        """
+        count = len(self._training_buffer)
+        target = self._collection_target_value
+        progress = 1.0 if target <= 0 else min(1.0, count / target)
+
+        filled = int(bar_width * progress)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        line = f"\rCollecting baseline data: [{bar}] {progress * 100:5.1f}% ({count}/{target})"
+
+        sys.stdout.write(line)
+        sys.stdout.write("\n" if final else "")
+        sys.stdout.flush()
+
     def _train(self) -> None:
         self._set_state(SupervisorState.TRAINING)
+        self._publish_status()
         try:
             self._anomaly_detector.fit(self._training_buffer)
         except Exception:
@@ -177,6 +256,7 @@ class Supervisor:
 
         if is_anomaly:
             self._set_state(SupervisorState.ALARM_ACTIVE)
+            self._total_alarms += 1
             event = AlarmEvent(
                 timestamp=int(time.time() * 1000),
                 vector=features,
@@ -185,5 +265,6 @@ class Supervisor:
                 frame=self.latest_frame,
             )
             self._alarm_handler.trigger_alarm(event)
+            self._publish_alarm(event)
         else:
             self._set_state(SupervisorState.MONITORING)

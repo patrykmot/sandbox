@@ -1,15 +1,20 @@
-"""Entry point: wires the default implementations into the Supervisor and runs it.
+"""Entry point: wires the default implementations together and runs the system.
 
 To swap any component for a different implementation (e.g. a video-file
 source instead of a live camera, or a different anomaly detector), only the
 imports and constructor calls below need to change - every other module
 depends solely on the interfaces in src/interfaces/, so nothing else in the
 system needs to know.
+
+Threading model (Phase II requirement): the OpenCV/Supervisor processing loop
+runs on a background daemon thread so it never blocks FastAPI's event loop,
+while the controller serves the dashboard on the main thread.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 
 from src.config import Config
 from src.core.supervisor import Supervisor
@@ -17,10 +22,26 @@ from src.implementations.camera_source import CameraVideoSource
 from src.implementations.console_alarm import ConsoleLoggerAlarmHandler
 from src.implementations.dummy_feature_encoder import DummyFeatureEncoder
 from src.implementations.iso_forest_detector import IsolationForestAnomalyDetector
+from src.implementations.web_controller import WebController
 from src.implementations.yolo_encoder import YOLOVideoEncoder
+from src.interfaces.controller import IController
+
+logger = logging.getLogger(__name__)
 
 
-def build_supervisor(config: Config) -> Supervisor:
+def build_controller(config: Config) -> IController:
+    # Component 7: Controller. Swap for a TUI/metrics/no-op controller by
+    # implementing IController and constructing it here instead.
+    return WebController(
+        host=config.server_host,
+        port=config.server_port,
+        max_alarms=config.dashboard_max_alarms,
+        stream_fps=config.dashboard_stream_fps,
+        jpeg_quality=config.dashboard_jpeg_quality,
+    )
+
+
+def build_supervisor(config: Config, controller: IController | None = None) -> Supervisor:
     # Component 1: Video Data Source. Swap for e.g. a VideoFileSource by
     # changing this single line.
     video_source = CameraVideoSource(camera_index=config.camera_index)
@@ -34,7 +55,7 @@ def build_supervisor(config: Config) -> Supervisor:
     )
 
     # Component 6: Feature Encoder. Phase I placeholder - replace with the
-    # real Phase II implementation by swapping this line.
+    # real implementation by swapping this line.
     feature_encoder = DummyFeatureEncoder()
 
     # Component 3: Anomaly Detector.
@@ -53,6 +74,7 @@ def build_supervisor(config: Config) -> Supervisor:
         anomaly_detector=anomaly_detector,
         alarm_handler=alarm_handler,
         collection_target_value=config.collection_target_value,
+        controller=controller,
     )
 
 
@@ -63,13 +85,27 @@ def main() -> None:
     )
 
     config = Config()
-    supervisor = build_supervisor(config)
+    controller = build_controller(config)
+    supervisor = build_supervisor(config, controller)
 
-    logging.getLogger(__name__).info(
-        "Starting Observer. Collecting %d vectors before training...",
-        config.collection_target_value,
+    # The processing loop MUST NOT run on the main thread - FastAPI's event
+    # loop lives there. daemon=True so Ctrl+C on the server tears it down.
+    processing_thread = threading.Thread(
+        target=supervisor.run_forever,
+        name="supervisor-loop",
+        daemon=True,
     )
-    supervisor.run_forever()
+    processing_thread.start()
+
+    logger.info(
+        "Observer started. Collecting %d vectors before training. Dashboard: http://%s:%d/",
+        config.collection_target_value,
+        config.server_host,
+        config.server_port,
+    )
+
+    # Blocks until shutdown.
+    controller.run()
 
 
 if __name__ == "__main__":

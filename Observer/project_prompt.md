@@ -173,3 +173,6 @@ Provide a single configuration file supporting environment variables or CLI over
 ---
 ---
 ---
+
+TODO: 1 State save for supervisor!
+TODO: 1 IVideoSource should be taken from video file.

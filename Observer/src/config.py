@@ -32,9 +32,14 @@ class Config(BaseSettings):
     camera_index: int | str = 0
     """OpenCV camera index (int) or RTSP/video stream URL (str)."""
 
-    # --- Web server (reserved for Phase II) -----------------------------------------
+    # --- Web dashboard ---------------------------------------------------------------
     server_host: str = "0.0.0.0"
     server_port: int = 8000
+    dashboard_max_alarms: int = 20
+    """How many recent alarm events (with frame snapshots) the panel keeps."""
+    dashboard_stream_fps: int = 15
+    """Target frame rate of the MJPEG live view."""
+    dashboard_jpeg_quality: int = 80
 
     # --- Video encoder (YOLO) -------------------------------------------------------
     yolo_model_path: str = "yolov8n.pt"
