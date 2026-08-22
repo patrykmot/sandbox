@@ -49,3 +49,9 @@ class Config(BaseSettings):
     # --- Anomaly detector ------------------------------------------------------------
     isolation_forest_contamination: float = 0.05
     model_save_path: str = "models/isolation_forest.joblib"
+
+    # --- Feature inspection ----------------------------------------------------------
+    feature_csv_enabled: bool = True
+    """Dump every produced FeatureVector to CSV for offline inspection."""
+    feature_csv_path: str = "feature_vectors.csv"
+    """Where that CSV is written. Truncated at the start of every run."""

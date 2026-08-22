@@ -28,13 +28,13 @@ class ConsoleLoggerAlarmHandler(IAlarmHandler):
             event.timestamp / 1000.0, tz=timezone.utc
         ).isoformat()
 
-        # message = (
-        #     f"\n{_BANNER}\n"
-        #     f"  ANOMALY DETECTED\n"
-        #     f"  Time:        {readable_time}\n"
-        #     f"  Score:       {event.anomaly_score:.4f}\n"
-        #     f"  Description: {event.description}\n"
-        #     f"  Objects:     {len(event.vector)}\n"
-        #     f"{_BANNER}\n"
-        # )
-        # print(message, file=sys.stderr)
+        message = (
+            f"\n{_BANNER}\n"
+            f"  ANOMALY DETECTED\n"
+            f"  Time:        {readable_time}\n"
+            f"  Score:       {event.anomaly_score:.4f}\n"
+            f"  Description: {event.description}\n"
+            f"  Objects:     {len(event.vector)}\n"
+            f"{_BANNER}\n"
+        )
+        print(message, file=sys.stderr)

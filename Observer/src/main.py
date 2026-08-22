@@ -20,7 +20,8 @@ from src.config import Config
 from src.core.supervisor import Supervisor
 from src.implementations.camera_source import CameraVideoSource
 from src.implementations.console_alarm import ConsoleLoggerAlarmHandler
-from src.implementations.dummy_feature_encoder import DummyFeatureEncoder
+from src.implementations.feature_vector_csv_writer import FeatureVectorCsvWriter
+from src.implementations.frame_merging_feature_encoder import FrameMergingFeatureEncoder
 from src.implementations.iso_forest_detector import IsolationForestAnomalyDetector
 from src.implementations.web_controller import WebController
 from src.implementations.yolo_encoder import YOLOVideoEncoder
@@ -54,9 +55,11 @@ def build_supervisor(config: Config, controller: IController | None = None) -> S
         tracker=config.yolo_tracker,
     )
 
-    # Component 6: Feature Encoder. Phase I placeholder - replace with the
-    # real implementation by swapping this line.
-    feature_encoder = DummyFeatureEncoder()
+    # Component 6: Feature Encoder. FrameMergingFeatureEncoder merges all
+    # objects sharing a timestamp into ONE 17-feature vector per frame, so
+    # object-to-object relations are what the detector learns. Swap in
+    # DummyFeatureEncoder here for one vector per object instead.
+    feature_encoder = FrameMergingFeatureEncoder()
 
     # Component 3: Anomaly Detector.
     anomaly_detector = IsolationForestAnomalyDetector(
@@ -67,6 +70,16 @@ def build_supervisor(config: Config, controller: IController | None = None) -> S
     # by implementing IAlarmHandler and constructing it here instead.
     alarm_handler = ConsoleLoggerAlarmHandler()
 
+    # Optional observation side channel: dumps every FeatureVector to CSV.
+    # Column names are taken from the encoder when it publishes them.
+    feature_csv_writer = None
+    if config.feature_csv_enabled:
+        feature_csv_writer = FeatureVectorCsvWriter(
+            path=config.feature_csv_path,
+            feature_names=getattr(feature_encoder, "FEATURE_NAMES", None),
+        )
+        logger.info("Writing FeatureVectors to %s", feature_csv_writer.path)
+
     return Supervisor(
         video_source=video_source,
         video_encoder=video_encoder,
@@ -75,6 +88,7 @@ def build_supervisor(config: Config, controller: IController | None = None) -> S
         alarm_handler=alarm_handler,
         collection_target_value=config.collection_target_value,
         controller=controller,
+        feature_csv_writer=feature_csv_writer,
     )
 
 

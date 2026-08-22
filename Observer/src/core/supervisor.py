@@ -10,8 +10,16 @@ import logging
 import sys
 import threading
 import time
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    # Type-checking only: importing this at runtime would make core depend on
+    # implementations, inverting the dependency direction the rest of the
+    # system keeps. The Supervisor only ever calls .write()/.close(), so any
+    # object with that shape works.
+    from src.implementations.feature_vector_csv_writer import FeatureVectorCsvWriter
 
 from src.interfaces.alarm import AlarmEvent, IAlarmHandler
 from src.interfaces.controller import IController, SystemStatus
@@ -51,6 +59,7 @@ class Supervisor:
         alarm_handler: IAlarmHandler,
         collection_target_value: int = 1000,
         controller: IController | None = None,
+        feature_csv_writer: "FeatureVectorCsvWriter | None" = None,
     ) -> None:
         self._video_source = video_source
         self._video_encoder = video_encoder
@@ -59,6 +68,7 @@ class Supervisor:
         self._alarm_handler = alarm_handler
         self._collection_target_value = collection_target_value
         self._controller = controller
+        self._feature_csv_writer = feature_csv_writer
 
         self._training_buffer: list[list[FeatureVector]] = []
         self._processed_frame_count = 0
@@ -133,6 +143,8 @@ class Supervisor:
                     break
         finally:
             self._video_source.release()
+            if self._feature_csv_writer is not None:
+                self._feature_csv_writer.close()
 
     def step(self) -> bool:
         """Execute a single iteration of the core loop.
@@ -158,6 +170,7 @@ class Supervisor:
             self._publish_frame(encoded.annotated_frame)
 
             features = self._feature_encoder.encode(encoded.states)
+            self._write_feature_csv(features)
             self._handle_features(features)
         except Exception:
             logger.exception("Unhandled error while processing frame; entering ERROR state.")
@@ -190,6 +203,15 @@ class Supervisor:
             self._controller.publish_frame(annotated_frame)
         except Exception:
             logger.exception("Controller.publish_frame failed; continuing.")
+
+    def _write_feature_csv(self, features: list[FeatureVector]) -> None:
+        """Observation-only side channel; must never disturb the pipeline."""
+        if self._feature_csv_writer is None:
+            return
+        try:
+            self._feature_csv_writer.write(features)
+        except Exception:
+            logger.exception("Feature CSV write failed; continuing.")
 
     def _publish_alarm(self, event: AlarmEvent) -> None:
         if self._controller is None:
