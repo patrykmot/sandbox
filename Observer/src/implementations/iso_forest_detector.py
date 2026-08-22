@@ -55,7 +55,7 @@ class IsolationForestAnomalyDetector(IAnomalyDetector):
         x_train = self._stack(flattened)
         model = IsolationForest(
             n_estimators=self._n_estimators,
-            max_samples=min(256, len(x_train)),
+            max_samples=min(1024, len(x_train)),
             contamination=self._contamination,
             random_state=self._random_state,
             n_jobs=-1,

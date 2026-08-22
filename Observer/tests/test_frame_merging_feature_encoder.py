@@ -95,7 +95,7 @@ def test_groups_by_timestamp_and_sorts_ascending() -> None:
     assert as_dict(features[1].vector)["dist_min"] == 10.0
 
 
-def test_single_object_zeroes_pairwise_features_only() -> None:
+def test_single_object_uses_sentinel_distance_not_zero() -> None:
     """One object has no pairs - but its own speed/size are still real values."""
     solo = StateVector(t=T1, x=7.0, y=0.0, vx=3.0, vy=4.0, size=800.0, object_type=0)
 
@@ -106,9 +106,17 @@ def test_single_object_zeroes_pairwise_features_only() -> None:
 
     assert f["num_objects"] == 1.0
 
-    # No pairs exist, so every pairwise column is structurally zero.
+    # No neighbour means "infinitely far", NOT zero - 0.0 has to stay
+    # reserved for objects that genuinely almost touch.
+    sentinel = FrameMergingFeatureEncoder.NO_PAIR_DISTANCE
+    assert sentinel == 7_777_777.0
     for name in FrameMergingFeatureEncoder.FEATURE_NAMES:
-        if name.startswith("dist_") or name.startswith("rel_speed_"):
+        if name.startswith("dist_"):
+            assert f[name] == sentinel, name
+
+    # Relative speed keeps 0.0: with no second object there is no relative motion.
+    for name in FrameMergingFeatureEncoder.FEATURE_NAMES:
+        if name.startswith("rel_speed_"):
             assert f[name] == 0.0, name
 
     # Single-object stats are still genuinely measured: ||(3,4)|| == 5.
@@ -116,6 +124,18 @@ def test_single_object_zeroes_pairwise_features_only() -> None:
     assert f["speed_max"] == 5.0
     assert f["size_p50"] == 800.0
     assert f["size_max"] == 800.0
+
+
+def test_touching_objects_stay_near_zero_and_far_from_the_sentinel() -> None:
+    """The whole point of the sentinel: near-zero distance must remain distinguishable."""
+    a = StateVector(t=T1, x=100.0, y=100.0, vx=0.0, vy=0.0, size=500.0, object_type=0)
+    b = StateVector(t=T1, x=100.5, y=100.0, vx=0.0, vy=0.0, size=500.0, object_type=0)
+
+    f = as_dict(FrameMergingFeatureEncoder().encode([a, b])[0].vector)
+
+    assert f["num_objects"] == 2.0
+    assert f["dist_min"] == 0.5
+    assert f["dist_min"] < FrameMergingFeatureEncoder.NO_PAIR_DISTANCE
 
 
 def test_empty_input_produces_no_features() -> None:

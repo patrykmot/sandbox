@@ -47,6 +47,15 @@ class FrameMergingFeatureEncoder(IFeatureEncoder):
 
     FEATURE_DIM: int = len(FEATURE_NAMES)
 
+    #: Value reported in every dist_* column when a frame holds a single
+    #: object. Such an object has no neighbour, so its distance to the
+    #: nearest other object is conceptually infinite - a large sentinel, not
+    #: 0.0. Keeping it far from zero matters: 0.0 must stay reserved for
+    #: objects that genuinely almost touch, which is an anomaly worth
+    #: detecting. A finite number (rather than math.inf) is required because
+    #: IsolationForest rejects non-finite input.
+    NO_PAIR_DISTANCE: float = 7_777_777.0
+
     def encode(self, states: list[StateVector]) -> list[FeatureVector]:
         """Merge each same-timestamp group of objects into a single FeatureVector.
 
@@ -74,12 +83,7 @@ class FrameMergingFeatureEncoder(IFeatureEncoder):
         # Absolute speed of each object: ||(vx, vy)||.
         speeds = np.linalg.norm(velocities, axis=1)
 
-        # Pairwise stats need at least two objects. With a single object
-        # there are no pairs at all, so these are reported as 0.0 rather
-        # than NaN: IsolationForest rejects non-finite input, and no
-        # information is actually lost - num_objects is itself a feature, so
-        # the model can learn that "num_objects == 1" implies the pairwise
-        # columns are structurally zero rather than genuinely measured.
+        # Pairwise stats need at least two objects.
         if num_objects >= 2:
             upper = np.triu_indices(num_objects, k=1)
             pair_distances = np.linalg.norm(
@@ -88,11 +92,18 @@ class FrameMergingFeatureEncoder(IFeatureEncoder):
             pair_rel_speeds = np.linalg.norm(
                 velocities[:, None, :] - velocities[None, :, :], axis=-1
             )[upper]
+            dist_min = self._min(pair_distances)
+            dist_p10, dist_p50, dist_p90 = self._percentiles(pair_distances)
         else:
-            pair_distances = np.empty(0, dtype=np.float64)
+            # A lone object has no neighbour: every distance column becomes
+            # the NO_PAIR_DISTANCE sentinel (see its definition above) so
+            # "nobody nearby" never looks like "objects touching".
             pair_rel_speeds = np.empty(0, dtype=np.float64)
+            dist_min = dist_p10 = dist_p50 = dist_p90 = self.NO_PAIR_DISTANCE
 
-        dist_p10, dist_p50, dist_p90 = self._percentiles(pair_distances)
+        # Relative speeds keep 0.0 for a lone object: with no second object
+        # there is no relative motion, and no information is lost because
+        # num_objects is itself a feature.
         rel_p10, rel_p50, rel_p90 = self._percentiles(pair_rel_speeds)
         speed_p10, speed_p50, speed_p90 = self._percentiles(speeds)
         size_p10, size_p50, size_p90 = self._percentiles(sizes)
@@ -100,7 +111,7 @@ class FrameMergingFeatureEncoder(IFeatureEncoder):
         vector = np.array(
             [
                 float(num_objects),
-                self._min(pair_distances),
+                dist_min,
                 dist_p10,
                 dist_p50,
                 dist_p90,
