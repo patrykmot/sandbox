@@ -1,0 +1,10 @@
+opencv-python
+ultralytics
+scikit-learn
+fastapi
+uvicorn
+numpy
+pydantic
+pydantic-settings
+pytest
+httpx
