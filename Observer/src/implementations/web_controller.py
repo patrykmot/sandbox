@@ -25,12 +25,17 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from src.interfaces.alarm import AlarmEvent
 from src.interfaces.controller import IController, SystemStatus
 from src.interfaces.state import SupervisorState
 
 _DASHBOARD_FILE = Path(__file__).with_name("dashboard.html")
+#: Locally served CSS/JS (Bootstrap, jQuery). Vendored on purpose: the
+#: dashboard must load on a machine that can reach this server but has no
+#: internet access, so nothing may come from a CDN.
+_STATIC_DIR = Path(__file__).with_name("static")
 _MJPEG_BOUNDARY = "frame"
 
 
@@ -170,6 +175,10 @@ class WebController(IController):
 
     def _build_app(self) -> FastAPI:
         app = FastAPI(title="Observer Dashboard", docs_url=None, redoc_url=None)
+
+        # Serves src/implementations/static/ at /static - every asset the
+        # dashboard needs comes from this server, never from the internet.
+        app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
         @app.get("/", response_class=HTMLResponse)
         def index() -> HTMLResponse:

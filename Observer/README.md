@@ -124,6 +124,11 @@ settings, all with working defaults, so it starts with no configuration at all.
 | `/api/status` | current state, frames processed, collection progress, alarm count |
 | `/video_feed` | live MJPEG stream of the annotated camera view |
 | `/alerts` | the most recent alarms, newest first |
+| `/static/...` | the dashboard's own CSS and JS |
+
+The page needs **no internet access** — Bootstrap and jQuery are vendored under
+`src/implementations/static/vendor/` and served by the app itself, so the dashboard
+works on an isolated network where the browser can reach this server and nothing else.
 
 ### Feature CSV
 
