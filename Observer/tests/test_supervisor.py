@@ -90,8 +90,13 @@ def build_supervisor(
     video_encoder: IVideoEncoder,
     controller: IController | None = None,
 ) -> Supervisor:
-    return Supervisor(
-        video_source=video_source,
+    """A Supervisor already past IDLE, wired to one fixed mock source.
+
+    The real system builds a source per camera selection; a test only ever
+    wants the one mock, so the factory ignores the camera id.
+    """
+    supervisor = Supervisor(
+        video_source_factory=lambda camera: video_source,
         video_encoder=video_encoder,
         feature_encoder=DummyFeatureEncoder(),
         anomaly_detector=IsolationForestAnomalyDetector(contamination=0.05),
@@ -99,6 +104,11 @@ def build_supervisor(
         collection_target_value=COLLECTION_TARGET,
         controller=controller,
     )
+    # Tests drive step() directly, which is only meaningful once scanning.
+    supervisor.initialize()
+    supervisor.request_start()
+    supervisor._drain_commands()  # apply it here rather than in run_forever()
+    return supervisor
 
 
 def test_reaches_monitoring_after_collection_target() -> None:
@@ -110,7 +120,6 @@ def test_reaches_monitoring_after_collection_target() -> None:
     video_encoder = build_mock_video_encoder(states)
     supervisor = build_supervisor(video_source, video_encoder)
 
-    supervisor.initialize()
     assert supervisor.state == SupervisorState.COLLECTING_DATA
 
     for _ in range(COLLECTION_TARGET):
@@ -132,7 +141,6 @@ def test_outlier_triggers_alarm() -> None:
     video_encoder = build_mock_video_encoder(states)
     supervisor = build_supervisor(video_source, video_encoder)
 
-    supervisor.initialize()
     for _ in range(outlier_index):
         assert supervisor.step() is True
     assert supervisor.state == SupervisorState.MONITORING
@@ -154,7 +162,6 @@ def test_collection_progress_is_printed_as_single_updating_line(capsys) -> None:
     video_encoder = build_mock_video_encoder(states)
     supervisor = build_supervisor(video_source, video_encoder)
 
-    supervisor.initialize()
     for _ in range(COLLECTION_TARGET):
         assert supervisor.step() is True
     assert supervisor.state == SupervisorState.MONITORING
@@ -180,7 +187,9 @@ def test_collection_progress_is_printed_as_single_updating_line(capsys) -> None:
     assert "Collecting baseline data:" not in out_after
 
 
-def test_video_source_exhaustion_stops_loop() -> None:
+def test_video_source_exhaustion_enters_error_and_releases_the_camera() -> None:
+    """A camera that stops delivering is an error the operator must see -
+    the loop parks in ERROR rather than dying quietly."""
     total_frames = 5
     states = make_normal_states(total_frames)
 
@@ -188,10 +197,31 @@ def test_video_source_exhaustion_stops_loop() -> None:
     video_encoder = build_mock_video_encoder(states)
     supervisor = build_supervisor(video_source, video_encoder)
 
-    supervisor.run_forever()
+    for _ in range(total_frames):
+        assert supervisor.step() is True
 
+    assert supervisor.step() is False
+    assert supervisor.state == SupervisorState.ERROR
+    assert supervisor.error is not None
     video_source.release.assert_called_once()
     assert supervisor.processed_frame_count == total_frames
+
+
+def test_stop_returns_to_idle_from_error() -> None:
+    """STOP is the only button offered in ERROR, so it has to work there."""
+    states = make_normal_states(1)
+    video_source = build_mock_video_source(0)  # no frames at all
+    video_encoder = build_mock_video_encoder(states)
+    supervisor = build_supervisor(video_source, video_encoder)
+
+    assert supervisor.step() is False
+    assert supervisor.state == SupervisorState.ERROR
+
+    supervisor.request_stop()
+    supervisor._drain_commands()
+
+    assert supervisor.state == SupervisorState.IDLE
+    assert supervisor.error is None
 
 
 def test_supervisor_pushes_annotated_frame_and_status_to_controller() -> None:
@@ -203,7 +233,6 @@ def test_supervisor_pushes_annotated_frame_and_status_to_controller() -> None:
     video_encoder = build_mock_video_encoder(states)
     supervisor = build_supervisor(video_source, video_encoder, controller=controller)
 
-    supervisor.initialize()
     for _ in range(total_frames):
         assert supervisor.step() is True
 
@@ -234,7 +263,6 @@ def test_supervisor_pushes_alarm_to_controller() -> None:
     video_encoder = build_mock_video_encoder(states)
     supervisor = build_supervisor(video_source, video_encoder, controller=controller)
 
-    supervisor.initialize()
     for _ in range(total_frames):
         assert supervisor.step() is True
 
@@ -260,7 +288,6 @@ def test_controller_failure_does_not_break_processing_loop() -> None:
     video_encoder = build_mock_video_encoder(states)
     supervisor = build_supervisor(video_source, video_encoder, controller=controller)
 
-    supervisor.initialize()
     for _ in range(total_frames):
         assert supervisor.step() is True
 

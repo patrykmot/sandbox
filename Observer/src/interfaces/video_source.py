@@ -3,8 +3,23 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import numpy as np
+
+
+@dataclass(frozen=True, slots=True)
+class CameraOption:
+    """One selectable video source, as offered to the operator.
+
+    Attributes:
+        id: What gets handed to the IVideoSource factory - an OpenCV device
+            index, or a stream/file URL.
+        name: Human-readable label, e.g. "Logitech C920 HD Pro".
+    """
+
+    id: int | str
+    name: str
 
 
 class IVideoSource(ABC):

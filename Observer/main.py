@@ -9,6 +9,9 @@ system needs to know.
 Threading model (Phase II requirement): the OpenCV/Supervisor processing loop
 runs on a background daemon thread so it never blocks FastAPI's event loop,
 while the controller serves the dashboard on the main thread.
+
+The system boots IDLE: the selected camera is previewed, but nothing is
+detected or learned until START is pressed in the dashboard.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import threading
 
 from src.config import Config
 from src.core.supervisor import Supervisor
+from src.implementations.camera_list import list_cameras
 from src.implementations.camera_source import CameraVideoSource
 from src.implementations.console_alarm import ConsoleLoggerAlarmHandler
 from src.implementations.feature_vector_csv_writer import FeatureVectorCsvWriter
@@ -25,27 +29,35 @@ from src.implementations.frame_merging_feature_encoder import FrameMergingFeatur
 from src.implementations.iso_forest_detector import IsolationForestAnomalyDetector
 from src.implementations.web_controller import WebController
 from src.implementations.yolo_encoder import YOLOVideoEncoder
-from src.interfaces.controller import IController
+from src.interfaces.video_source import CameraOption, IVideoSource
 
 logger = logging.getLogger(__name__)
 
 
-def build_controller(config: Config) -> IController:
-    # Component 7: Controller. Swap for a TUI/metrics/no-op controller by
-    # implementing IController and constructing it here instead.
-    return WebController(
-        host=config.server_host,
-        port=config.server_port,
-        max_alarms=config.dashboard_max_alarms,
-        stream_fps=config.dashboard_stream_fps,
-        jpeg_quality=config.dashboard_jpeg_quality,
-    )
+def build_cameras_provider(config: Config):
+    """Returns the callable the dashboard uses to fill its camera dropdown."""
+
+    def provider(active: int | str | None = None) -> list[CameraOption]:
+        return list_cameras(max_probe=config.camera_probe_max, always_include=active)
+
+    return provider
 
 
-def build_supervisor(config: Config, controller: IController | None = None) -> Supervisor:
-    # Component 1: Video Data Source. Swap for e.g. a VideoFileSource by
-    # changing this single line.
-    video_source = CameraVideoSource(camera_index=config.camera_index)
+def default_camera(config: Config) -> int | str:
+    """The camera selected on boot: the first one found, else the configured one."""
+    cameras = list_cameras(max_probe=config.camera_probe_max)
+    if cameras:
+        return cameras[0].id
+    logger.warning("No camera found; falling back to configured CAMERA_INDEX=%r.", config.camera_index)
+    return config.camera_index
+
+
+def build_supervisor(config: Config, controller: WebController | None = None) -> Supervisor:
+    # Component 1: Video Data Source. The operator picks the camera at
+    # runtime, so the Supervisor gets a factory and opens sources itself.
+    # Swap for e.g. a VideoFileSource by changing this single line.
+    def video_source_factory(camera: int | str) -> IVideoSource:
+        return CameraVideoSource(camera_index=camera)
 
     # Component 2: Video Encoder. Swap for another detector/tracker backend
     # by implementing IVideoEncoder and constructing it here instead.
@@ -81,7 +93,7 @@ def build_supervisor(config: Config, controller: IController | None = None) -> S
         logger.info("Writing FeatureVectors to %s", feature_csv_writer.path)
 
     return Supervisor(
-        video_source=video_source,
+        video_source_factory=video_source_factory,
         video_encoder=video_encoder,
         feature_encoder=feature_encoder,
         anomaly_detector=anomaly_detector,
@@ -89,6 +101,7 @@ def build_supervisor(config: Config, controller: IController | None = None) -> S
         collection_target_value=config.collection_target_value,
         controller=controller,
         feature_csv_writer=feature_csv_writer,
+        camera=default_camera(config),
     )
 
 
@@ -99,8 +112,23 @@ def main() -> None:
     )
 
     config = Config()
-    controller = build_controller(config)
+
+    # Component 7: Controller. Swap for a TUI/metrics/no-op controller by
+    # implementing IController and constructing it here instead.
+    controller = WebController(
+        host=config.server_host,
+        port=config.server_port,
+        max_alarms=config.dashboard_max_alarms,
+        stream_fps=config.dashboard_stream_fps,
+        jpeg_quality=config.dashboard_jpeg_quality,
+        cameras_provider=build_cameras_provider(config),
+    )
+
     supervisor = build_supervisor(config, controller)
+
+    # The dashboard drives the Supervisor through this, and only through
+    # this: requests are queued and applied on the loop's own thread.
+    controller.bind_control(supervisor)
 
     # The processing loop MUST NOT run on the main thread - FastAPI's event
     # loop lives there. daemon=True so Ctrl+C on the server tears it down.
@@ -112,10 +140,11 @@ def main() -> None:
     processing_thread.start()
 
     logger.info(
-        "Observer started. Collecting %d vectors before training. Dashboard: http://%s:%d/",
-        config.collection_target_value,
+        "Observer ready on http://%s:%d/ - previewing camera %r, press Start to collect %d frames.",
         config.server_host,
         config.server_port,
+        supervisor.camera,
+        config.collection_target_value,
     )
 
     # Blocks until shutdown.

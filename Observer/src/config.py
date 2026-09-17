@@ -30,7 +30,14 @@ class Config(BaseSettings):
 
     # --- Video source --------------------------------------------------------------
     camera_index: int | str = 0
-    """OpenCV camera index (int) or RTSP/video stream URL (str)."""
+    """Fallback video source when no camera can be enumerated: an OpenCV
+    camera index (int) or an RTSP/video stream URL (str). Normally the
+    dashboard's camera picker decides instead."""
+
+    camera_probe_max: int = 5
+    """How many device indices to try when enumerating cameras. Cameras are
+    found by opening indices 0..camera_probe_max-1 and keeping the ones that
+    answer - raise it if a camera sits on a higher index."""
 
     # --- Web dashboard ---------------------------------------------------------------
     server_host: str = "0.0.0.0"

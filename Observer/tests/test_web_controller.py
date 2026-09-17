@@ -10,6 +10,7 @@ the suite still runs; install requirements.txt to exercise them.
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import create_autospec
 
 import numpy as np
 import pytest
@@ -20,8 +21,9 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from src.implementations.web_controller import WebController  # noqa: E402
 from src.interfaces.alarm import AlarmEvent  # noqa: E402
-from src.interfaces.controller import SystemStatus  # noqa: E402
+from src.interfaces.controller import IControlTarget, SystemStatus  # noqa: E402
 from src.interfaces.encoder import FeatureVector  # noqa: E402
+from src.interfaces.video_source import CameraOption  # noqa: E402
 from src.interfaces.state import SupervisorState  # noqa: E402
 
 FRAME = np.full((32, 32, 3), 128, dtype=np.uint8)
@@ -195,3 +197,111 @@ def test_mjpeg_stream_waits_without_yielding_before_first_frame(
         return [chunk async for chunk in controller._mjpeg_stream(request)]
 
     assert asyncio.run(collect()) == []
+
+# --- Control endpoints ----------------------------------------------------------------
+#
+# The controller never acts itself: it forwards requests to the Supervisor,
+# which applies them on its own thread. So these assert forwarding, not
+# behaviour - the behaviour lives in test_supervisor_controls.py.
+
+
+@pytest.fixture
+def control() -> IControlTarget:
+    return create_autospec(IControlTarget, instance=True)
+
+
+@pytest.fixture
+def wired(control: IControlTarget) -> TestClient:
+    controller = WebController(
+        cameras_provider=lambda active: [
+            CameraOption(id=0, name="Integrated Webcam"),
+            CameraOption(id=1, name="Logitech C920"),
+        ]
+    )
+    controller.bind_control(control)
+    return TestClient(controller.app)
+
+
+def test_control_endpoints_are_503_without_a_supervisor(client: TestClient) -> None:
+    """A dashboard with nothing bound is read-only, not broken."""
+    assert client.post("/api/control/start").status_code == 503
+    assert client.post("/api/control/stop").status_code == 503
+    assert client.post("/api/control/camera", json={"camera": 1}).status_code == 503
+
+
+def test_start_and_stop_are_forwarded(wired: TestClient, control: IControlTarget) -> None:
+    assert wired.post("/api/control/start").status_code == 200
+    control.request_start.assert_called_once()
+
+    assert wired.post("/api/control/stop").status_code == 200
+    control.request_stop.assert_called_once()
+
+
+def test_camera_selection_is_forwarded_as_an_index(
+    wired: TestClient, control: IControlTarget
+) -> None:
+    """A <select> sends strings; an OpenCV index has to arrive as an int."""
+    assert wired.post("/api/control/camera", json={"camera": "1"}).status_code == 200
+    control.request_camera.assert_called_once_with(1)
+
+
+def test_camera_selection_keeps_urls_as_strings(
+    wired: TestClient, control: IControlTarget
+) -> None:
+    url = "rtsp://user:pass@host/stream"
+    assert wired.post("/api/control/camera", json={"camera": url}).status_code == 200
+    control.request_camera.assert_called_once_with(url)
+
+
+def test_camera_selection_rejects_nonsense(wired: TestClient, control: IControlTarget) -> None:
+    assert wired.post("/api/control/camera", json={}).status_code == 422
+    assert wired.post("/api/control/camera", json={"camera": ""}).status_code == 422
+    control.request_camera.assert_not_called()
+
+
+def test_camera_list_is_served(wired: TestClient) -> None:
+    payload = wired.get("/api/cameras").json()
+    assert payload["cameras"] == [
+        {"id": 0, "name": "Integrated Webcam"},
+        {"id": 1, "name": "Logitech C920"},
+    ]
+
+
+def test_camera_list_survives_a_failing_provider() -> None:
+    """Enumeration touches hardware and can fail; the page must still load."""
+
+    def boom(active):
+        raise RuntimeError("no such device")
+
+    client = TestClient(WebController(cameras_provider=boom).app)
+    assert client.get("/api/cameras").json()["cameras"] == []
+
+
+def test_status_reports_camera_and_error(client: TestClient, controller: WebController) -> None:
+    controller.publish_status(
+        SystemStatus(
+            state=SupervisorState.IDLE,
+            processed_frame_count=0,
+            collection_progress=0.0,
+            collected_count=0,
+            collection_target=1000,
+            total_alarms=0,
+            camera=1,
+            error="Could not open camera 1.",
+        )
+    )
+    payload = client.get("/api/status").json()
+    assert payload["state"] == "IDLE"
+    assert payload["camera"] == 1
+    assert payload["error"] == "Could not open camera 1."
+
+
+def test_clear_alarms_empties_the_panel(
+    client: TestClient, controller: WebController
+) -> None:
+    controller.publish_alarm(make_alarm_event())
+    assert len(client.get("/alerts").json()["alarms"]) == 1
+
+    controller.clear_alarms()
+
+    assert client.get("/alerts").json()["alarms"] == []

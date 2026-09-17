@@ -32,6 +32,15 @@ class YOLOVideoEncoder(IVideoEncoder):
         # track_id -> (x, y, t_ms) of that object's last observed position.
         self._last_seen: dict[int, tuple[float, float, int]] = {}
 
+    def reset(self) -> None:
+        """Drop remembered track positions.
+
+        Called when a scan starts. Without this the first frames of a new run
+        would compute velocities against positions from the previous one -
+        possibly on a different camera - producing huge bogus speeds.
+        """
+        self._last_seen.clear()
+
     def encode(self, frame: np.ndarray) -> EncodedFrame:
         now_ms = time.time_ns() // 1_000_000
 

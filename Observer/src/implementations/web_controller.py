@@ -14,22 +14,27 @@ client - the MJPEG stream then just re-sends the stored bytes.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.interfaces.alarm import AlarmEvent
-from src.interfaces.controller import IController, SystemStatus
+from src.interfaces.controller import IController, IControlTarget, SystemStatus
 from src.interfaces.state import SupervisorState
+from src.interfaces.video_source import CameraOption
+
+logger = logging.getLogger(__name__)
 
 _DASHBOARD_FILE = Path(__file__).with_name("dashboard.html")
 #: Locally served CSS/JS (Bootstrap, jQuery). Vendored on purpose: the
@@ -67,9 +72,15 @@ class WebController(IController):
         max_alarms: int = 20,
         stream_fps: int = 15,
         jpeg_quality: int = 80,
+        control: IControlTarget | None = None,
+        cameras_provider: Callable[[int | str | None], list[CameraOption]] | None = None,
     ) -> None:
         self._host = host
         self._port = port
+        # Commands go out through this; without one the dashboard is
+        # read-only and the control endpoints report 503.
+        self._control = control
+        self._cameras_provider = cameras_provider
         self._stream_interval = 1.0 / max(1, stream_fps)
         self._jpeg_params = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
 
@@ -80,6 +91,15 @@ class WebController(IController):
         self._next_alarm_id = 1
 
         self.app = self._build_app()
+
+    def bind_control(self, control: IControlTarget) -> None:
+        """Attach the Supervisor after construction.
+
+        The two know about each other in opposite directions - the Supervisor
+        pushes into this controller, this controller requests from the
+        Supervisor - so one of the two links has to be made after both exist.
+        """
+        self._control = control
 
     # --- IController (called from the Supervisor's background thread) -----------------
 
@@ -108,6 +128,11 @@ class WebController(IController):
             self._next_alarm_id += 1
             self._alarms.append(record)
 
+    def clear_alarms(self) -> None:
+        """Drop the alarm panel's contents (a new scan has started)."""
+        with self._lock:
+            self._alarms.clear()
+
     def run(self) -> None:
         """Block serving the dashboard (main thread)."""
         uvicorn.run(self.app, host=self._host, port=self._port, log_level="info")
@@ -119,6 +144,11 @@ class WebController(IController):
         if not success:
             return None
         return buffer.tobytes()
+
+    def _require_control(self) -> IControlTarget:
+        if self._control is None:
+            raise HTTPException(status_code=503, detail="This dashboard is read-only.")
+        return self._control
 
     def _status_payload(self) -> dict:
         with self._lock:
@@ -135,6 +165,8 @@ class WebController(IController):
                 "collected_count": 0,
                 "collection_target": 0,
                 "total_alarms": total_alarms,
+                "camera": None,
+                "error": None,
             }
 
         return {
@@ -145,6 +177,8 @@ class WebController(IController):
             "collected_count": status.collected_count,
             "collection_target": status.collection_target,
             "total_alarms": status.total_alarms,
+            "camera": status.camera,
+            "error": status.error,
         }
 
     async def _mjpeg_stream(self, request: Request):
@@ -195,6 +229,49 @@ class WebController(IController):
                 media_type=f"multipart/x-mixed-replace; boundary={_MJPEG_BOUNDARY}",
             )
 
+        # --- Control -----------------------------------------------------------------
+        #
+        # Every one of these only *requests* something: the Supervisor applies
+        # it on its own thread at a frame boundary, and the next /api/status
+        # poll is what tells the browser whether it happened.
+
+        @app.get("/api/cameras")
+        def api_cameras() -> dict:
+            with self._lock:
+                selected = self._status.camera if self._status else None
+
+            if self._cameras_provider is None:
+                cameras: list[CameraOption] = []
+            else:
+                try:
+                    cameras = self._cameras_provider(selected)
+                except Exception:
+                    logger.exception("Listing cameras failed; returning an empty list.")
+                    cameras = []
+
+            return {
+                "cameras": [{"id": c.id, "name": c.name} for c in cameras],
+                "selected": selected,
+            }
+
+        @app.post("/api/control/start")
+        def api_start() -> dict:
+            self._require_control().request_start()
+            return {"requested": "start"}
+
+        @app.post("/api/control/stop")
+        def api_stop() -> dict:
+            self._require_control().request_stop()
+            return {"requested": "stop"}
+
+        @app.post("/api/control/camera")
+        def api_camera(payload: dict = Body(...)) -> dict:
+            if "camera" not in payload:
+                raise HTTPException(status_code=422, detail="Missing 'camera'.")
+            camera = _coerce_camera(payload["camera"])
+            self._require_control().request_camera(camera)
+            return {"requested": "camera", "camera": camera}
+
         @app.get("/alerts")
         def alerts() -> dict:
             with self._lock:
@@ -228,3 +305,24 @@ class WebController(IController):
             return Response(content=match.frame_jpeg, media_type="image/jpeg")
 
         return app
+
+
+def _coerce_camera(value: object) -> int | str:
+    """A camera id is an OpenCV index or a stream URL.
+
+    JSON gives us whichever the browser sent, and a <select> always sends
+    strings - so "1" has to become 1, while "rtsp://..." stays as it is.
+    """
+    if isinstance(value, bool):
+        raise HTTPException(status_code=422, detail="Invalid camera id.")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise HTTPException(status_code=422, detail="Invalid camera id.")
+        try:
+            return int(text)
+        except ValueError:
+            return text
+    raise HTTPException(status_code=422, detail="Invalid camera id.")
