@@ -1,14 +1,19 @@
-"""Implementation 1 of IController: a FastAPI web dashboard.
+"""The operator-facing FastAPI dashboard.
 
 Threading model
 ---------------
-The Supervisor loop runs on a background thread and *pushes* into this
-object (publish_status / publish_frame / publish_alarm). FastAPI serves
-requests on the main thread. Every piece of shared mutable state below is
-therefore guarded by a single `threading.Lock`.
+The Supervisor loop runs on a background thread; FastAPI serves requests on
+the main thread. Nothing is pushed here: status and frames are *pulled* from
+the bound ISupervisorPort when a request actually asks for them, and both
+reads are lock-guarded snapshots on the Supervisor's side.
 
-Frames are JPEG-encoded once, at push time, rather than per connected
-client - the MJPEG stream then just re-sends the stored bytes.
+Alarms are the exception, because they are events rather than state: this
+class is an IAlarmHandler, and the Supervisor fans alarms out to it the same
+way it does to the console logger.
+
+Frames are JPEG-encoded at most once each, on first request, and the result
+is cached by frame identity - so several viewers share one encode and no
+viewers cost nothing. `self._lock` guards this class's own mutable state.
 """
 
 from __future__ import annotations
@@ -29,8 +34,8 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from src.interfaces.alarm import AlarmEvent
-from src.interfaces.controller import IController, IControlTarget, SystemStatus
+from src.interfaces.alarm import AlarmEvent, IAlarmHandler
+from src.interfaces.controller import ISupervisorPort, SystemStatus
 from src.interfaces.state import SupervisorState
 from src.interfaces.video_source import CameraOption
 
@@ -49,6 +54,7 @@ class AlarmRecord:
     """One row of the alarm panel, with its Camera Frame View already encoded."""
 
     id: int
+    run_id: int
     timestamp: int
     anomaly_score: float
     description: str
@@ -62,7 +68,7 @@ class AlarmRecord:
         )
 
 
-class WebController(IController):
+class WebController(IAlarmHandler):
     """Serves the live dashboard, MJPEG stream, status and alarm APIs."""
 
     def __init__(
@@ -72,53 +78,50 @@ class WebController(IController):
         max_alarms: int = 20,
         stream_fps: int = 15,
         jpeg_quality: int = 80,
-        control: IControlTarget | None = None,
+        supervisor: ISupervisorPort | None = None,
         cameras_provider: Callable[[int | str | None], list[CameraOption]] | None = None,
     ) -> None:
         self._host = host
         self._port = port
-        # Commands go out through this; without one the dashboard is
-        # read-only and the control endpoints report 503.
-        self._control = control
+        # Everything this dashboard reads and every command it sends goes
+        # through here; without one the page is read-only and the control
+        # endpoints report 503.
+        self._supervisor = supervisor
         self._cameras_provider = cameras_provider
         self._stream_interval = 1.0 / max(1, stream_fps)
         self._jpeg_params = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
 
         self._lock = threading.Lock()
-        self._latest_jpeg: bytes | None = None
-        self._status: SystemStatus | None = None
+        #: Last (frame, its JPEG bytes). Keeping the array alive is what makes
+        #: the identity check in _jpeg_for() safe.
+        self._jpeg_cache: tuple[np.ndarray, bytes] | None = None
         self._alarms: deque[AlarmRecord] = deque(maxlen=max_alarms)
         self._next_alarm_id = 1
 
         self.app = self._build_app()
 
-    def bind_control(self, control: IControlTarget) -> None:
+    def bind_supervisor(self, supervisor: ISupervisorPort) -> None:
         """Attach the Supervisor after construction.
 
-        The two know about each other in opposite directions - the Supervisor
-        pushes into this controller, this controller requests from the
-        Supervisor - so one of the two links has to be made after both exist.
+        The dashboard is built first so it can be handed to the Supervisor as
+        an alarm sink, so this last link has to be made once both exist.
         """
-        self._control = control
+        self._supervisor = supervisor
 
-    # --- IController (called from the Supervisor's background thread) -----------------
+    # --- IAlarmHandler (called from the Supervisor's background thread) ---------------
 
-    def publish_status(self, status: SystemStatus) -> None:
-        with self._lock:
-            self._status = status
-
-    def publish_frame(self, annotated_frame: np.ndarray) -> None:
-        jpeg = self._encode_jpeg(annotated_frame)
-        if jpeg is None:
-            return
-        with self._lock:
-            self._latest_jpeg = jpeg
-
-    def publish_alarm(self, event: AlarmEvent) -> None:
+    def trigger_alarm(self, event: AlarmEvent) -> None:
+        """Record an alarm for the panel, stamped with the run that raised it."""
+        # Read the run id before taking our own lock: never hold this lock
+        # while reaching for the Supervisor's.
+        status = self._current_status()
+        run_id = status.run_id if status is not None else 0
         frame_jpeg = self._encode_jpeg(event.frame) if event.frame is not None else None
+
         with self._lock:
             record = AlarmRecord(
                 id=self._next_alarm_id,
+                run_id=run_id,
                 timestamp=event.timestamp,
                 anomaly_score=event.anomaly_score,
                 description=event.description,
@@ -127,11 +130,6 @@ class WebController(IController):
             )
             self._next_alarm_id += 1
             self._alarms.append(record)
-
-    def clear_alarms(self) -> None:
-        """Drop the alarm panel's contents (a new scan has started)."""
-        with self._lock:
-            self._alarms.clear()
 
     def run(self) -> None:
         """Block serving the dashboard (main thread)."""
@@ -145,18 +143,44 @@ class WebController(IController):
             return None
         return buffer.tobytes()
 
-    def _require_control(self) -> IControlTarget:
-        if self._control is None:
+    def _jpeg_for(self, frame: np.ndarray) -> bytes | None:
+        """This frame's JPEG, encoding it at most once.
+
+        The stream polls faster than the loop produces frames and several
+        viewers share the same one, so the last (frame, bytes) pair is cached
+        and matched by identity. Holding a reference to the array keeps it
+        alive, so `is` can never match a recycled object.
+        """
+        with self._lock:
+            cached = self._jpeg_cache
+        if cached is not None and cached[0] is frame:
+            return cached[1]
+
+        jpeg = self._encode_jpeg(frame)
+        if jpeg is None:
+            return None
+        with self._lock:
+            self._jpeg_cache = (frame, jpeg)
+        return jpeg
+
+    def _require_supervisor(self) -> ISupervisorPort:
+        if self._supervisor is None:
             raise HTTPException(status_code=503, detail="This dashboard is read-only.")
-        return self._control
+        return self._supervisor
+
+    def _current_status(self) -> SystemStatus | None:
+        """The Supervisor's own snapshot, or None when nothing is bound."""
+        if self._supervisor is None:
+            return None
+        return self._supervisor.build_status()
 
     def _status_payload(self) -> dict:
-        with self._lock:
-            status = self._status
-            total_alarms = len(self._alarms)
+        status = self._current_status()
 
         if status is None:
-            # The Supervisor thread hasn't produced its first frame yet.
+            # Nothing bound: a read-only dashboard, not a broken one.
+            with self._lock:
+                total_alarms = len(self._alarms)
             return {
                 "state": SupervisorState.INITIALIZING.name,
                 "processed_frame_count": 0,
@@ -193,8 +217,8 @@ class WebController(IController):
             if await request.is_disconnected():
                 break
 
-            with self._lock:
-                jpeg = self._latest_jpeg
+            frame = self._supervisor.latest_frame if self._supervisor is not None else None
+            jpeg = self._jpeg_for(frame) if frame is not None else None
 
             if jpeg is not None:
                 yield (
@@ -237,8 +261,8 @@ class WebController(IController):
 
         @app.get("/api/cameras")
         def api_cameras() -> dict:
-            with self._lock:
-                selected = self._status.camera if self._status else None
+            status = self._current_status()
+            selected = status.camera if status is not None else None
 
             if self._cameras_provider is None:
                 cameras: list[CameraOption] = []
@@ -256,12 +280,12 @@ class WebController(IController):
 
         @app.post("/api/control/start")
         def api_start() -> dict:
-            self._require_control().request_start()
+            self._require_supervisor().request_start()
             return {"requested": "start"}
 
         @app.post("/api/control/stop")
         def api_stop() -> dict:
-            self._require_control().request_stop()
+            self._require_supervisor().request_stop()
             return {"requested": "stop"}
 
         @app.post("/api/control/camera")
@@ -269,13 +293,19 @@ class WebController(IController):
             if "camera" not in payload:
                 raise HTTPException(status_code=422, detail="Missing 'camera'.")
             camera = _coerce_camera(payload["camera"])
-            self._require_control().request_camera(camera)
+            self._require_supervisor().request_camera(camera)
             return {"requested": "camera", "camera": camera}
 
         @app.get("/alerts")
         def alerts() -> dict:
+            # Alarms scored against a previous baseline mean nothing against
+            # the current one, so only this run's are shown. No one has to
+            # tell the panel to forget them.
+            status = self._current_status()
+            run_id = status.run_id if status is not None else 0
+
             with self._lock:
-                records = list(self._alarms)
+                records = [record for record in self._alarms if record.run_id == run_id]
 
             # Newest first - that's the order the panel displays them in.
             return {
@@ -297,6 +327,8 @@ class WebController(IController):
 
         @app.get("/api/alarms/{alarm_id}/frame")
         def alarm_frame(alarm_id: int) -> Response:
+            # Not run-filtered: a thumbnail URL already handed out stays
+            # fetchable for as long as the record is in the deque.
             with self._lock:
                 match = next((r for r in self._alarms if r.id == alarm_id), None)
 

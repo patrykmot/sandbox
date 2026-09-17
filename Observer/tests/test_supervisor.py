@@ -20,8 +20,9 @@ import pytest
 from src.core.supervisor import Supervisor, SupervisorState
 from src.implementations.console_alarm import ConsoleLoggerAlarmHandler
 from src.implementations.dummy_feature_encoder import DummyFeatureEncoder
+from src.implementations.composite_alarm import CompositeAlarmHandler
 from src.implementations.iso_forest_detector import IsolationForestAnomalyDetector
-from src.interfaces.controller import IController
+from src.interfaces.alarm import IAlarmHandler
 from src.interfaces.encoder import EncodedFrame, IVideoEncoder, StateVector
 from src.interfaces.video_source import IVideoSource
 
@@ -88,7 +89,7 @@ def build_mock_video_encoder(state_sequence: list[list[StateVector]]) -> IVideoE
 def build_supervisor(
     video_source: IVideoSource,
     video_encoder: IVideoEncoder,
-    controller: IController | None = None,
+    alarm_handler: IAlarmHandler | None = None,
 ) -> Supervisor:
     """A Supervisor already past IDLE, wired to one fixed mock source.
 
@@ -100,9 +101,8 @@ def build_supervisor(
         video_encoder=video_encoder,
         feature_encoder=DummyFeatureEncoder(),
         anomaly_detector=IsolationForestAnomalyDetector(contamination=0.05),
-        alarm_handler=ConsoleLoggerAlarmHandler(),
+        alarm_handler=alarm_handler or ConsoleLoggerAlarmHandler(),
         collection_target_value=COLLECTION_TARGET,
-        controller=controller,
     )
     # Tests drive step() directly, which is only meaningful once scanning.
     supervisor.initialize()
@@ -224,26 +224,23 @@ def test_stop_returns_to_idle_from_error() -> None:
     assert supervisor.error is None
 
 
-def test_supervisor_pushes_annotated_frame_and_status_to_controller() -> None:
+def test_latest_frame_and_status_expose_what_a_ui_needs() -> None:
+    """Nothing is pushed anywhere: a UI pulls these two, so they must be
+    right after every frame."""
     total_frames = 3
     states = make_normal_states(total_frames)
 
-    controller = create_autospec(IController, instance=True)
     video_source = build_mock_video_source(total_frames)
     video_encoder = build_mock_video_encoder(states)
-    supervisor = build_supervisor(video_source, video_encoder, controller=controller)
+    supervisor = build_supervisor(video_source, video_encoder)
 
     for _ in range(total_frames):
         assert supervisor.step() is True
 
-    assert controller.publish_frame.call_count == total_frames
-    assert controller.publish_status.call_count == total_frames
+    # The UI must see the annotated frame, never the raw camera frame.
+    assert np.array_equal(supervisor.latest_frame, ANNOTATED_FRAME)
 
-    # The UI must receive the annotated frame, never the raw camera frame.
-    pushed_frame = controller.publish_frame.call_args[0][0]
-    assert np.array_equal(pushed_frame, ANNOTATED_FRAME)
-
-    status = controller.publish_status.call_args[0][0]
+    status = supervisor.build_status()
     assert status.state == SupervisorState.COLLECTING_DATA
     assert status.processed_frame_count == total_frames
     assert status.collected_count == total_frames
@@ -251,47 +248,64 @@ def test_supervisor_pushes_annotated_frame_and_status_to_controller() -> None:
     assert status.total_alarms == 0
 
 
-def test_supervisor_pushes_alarm_to_controller() -> None:
+def test_alarm_reaches_the_alarm_handler() -> None:
+    """The handler is the one and only way an event leaves the Supervisor."""
     outlier_index = COLLECTION_TARGET + 3
     total_frames = outlier_index + 1
 
     states = make_normal_states(total_frames)
     states[outlier_index] = make_outlier_state(states[outlier_index][0].t)
 
-    controller = create_autospec(IController, instance=True)
+    alarm_handler = create_autospec(IAlarmHandler, instance=True)
     video_source = build_mock_video_source(total_frames)
     video_encoder = build_mock_video_encoder(states)
-    supervisor = build_supervisor(video_source, video_encoder, controller=controller)
+    supervisor = build_supervisor(video_source, video_encoder, alarm_handler=alarm_handler)
 
     for _ in range(total_frames):
         assert supervisor.step() is True
 
     assert supervisor.state == SupervisorState.ALARM_ACTIVE
-    controller.publish_alarm.assert_called_once()
+    alarm_handler.trigger_alarm.assert_called_once()
 
-    event = controller.publish_alarm.call_args[0][0]
+    event = alarm_handler.trigger_alarm.call_args[0][0]
     assert event.anomaly_score < 0
     assert np.array_equal(event.frame, ANNOTATED_FRAME)
     assert supervisor.total_alarms == 1
 
 
-def test_controller_failure_does_not_break_processing_loop() -> None:
-    """A misbehaving UI must never take down the processing loop."""
-    total_frames = 3
-    states = make_normal_states(total_frames)
+def test_a_failing_alarm_sink_does_not_break_processing_loop() -> None:
+    """A misbehaving UI must never take down the processing loop.
 
-    controller = create_autospec(IController, instance=True)
-    controller.publish_status.side_effect = RuntimeError("UI exploded")
-    controller.publish_frame.side_effect = RuntimeError("UI exploded")
+    The UI is now an alarm sink like any other, and the Supervisor calls the
+    handler from inside the frame loop's try block - so the isolation has to
+    come from the composite. This is that guarantee, end to end.
+    """
+    outlier_index = COLLECTION_TARGET + 3
+    total_frames = outlier_index + 2
+
+    states = make_normal_states(total_frames)
+    states[outlier_index] = make_outlier_state(states[outlier_index][0].t)
+
+    exploding = create_autospec(IAlarmHandler, instance=True)
+    exploding.trigger_alarm.side_effect = RuntimeError("UI exploded")
+    surviving = create_autospec(IAlarmHandler, instance=True)
 
     video_source = build_mock_video_source(total_frames)
     video_encoder = build_mock_video_encoder(states)
-    supervisor = build_supervisor(video_source, video_encoder, controller=controller)
+    supervisor = build_supervisor(
+        video_source,
+        video_encoder,
+        alarm_handler=CompositeAlarmHandler([exploding, surviving]),
+    )
 
     for _ in range(total_frames):
         assert supervisor.step() is True
 
-    assert supervisor.state == SupervisorState.COLLECTING_DATA
+    # However many alarms this run raised, the sink behind the failing one
+    # heard every single one of them.
+    assert exploding.trigger_alarm.call_count >= 1
+    assert surviving.trigger_alarm.call_count == exploding.trigger_alarm.call_count
+    assert supervisor.state != SupervisorState.ERROR
     assert supervisor.processed_frame_count == total_frames
 
 

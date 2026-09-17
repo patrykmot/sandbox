@@ -15,7 +15,6 @@ from src.core.supervisor import Supervisor, SupervisorState
 from src.implementations.console_alarm import ConsoleLoggerAlarmHandler
 from src.implementations.dummy_feature_encoder import DummyFeatureEncoder
 from src.implementations.iso_forest_detector import IsolationForestAnomalyDetector
-from src.interfaces.controller import IController
 from src.interfaces.encoder import EncodedFrame, IVideoEncoder, StateVector
 from src.interfaces.video_source import IVideoSource
 
@@ -40,7 +39,6 @@ def make_encoder() -> IVideoEncoder:
 
 def build(
     opened: list[int | str] | None = None,
-    controller: IController | None = None,
     source: IVideoSource | None = None,
     encoder: IVideoEncoder | None = None,
 ) -> Supervisor:
@@ -58,7 +56,6 @@ def build(
         anomaly_detector=IsolationForestAnomalyDetector(contamination=0.05),
         alarm_handler=ConsoleLoggerAlarmHandler(),
         collection_target_value=10,
-        controller=controller,
         camera=0,
     )
     supervisor.initialize()
@@ -80,27 +77,65 @@ def test_boots_into_idle_without_opening_anything() -> None:
 
 def test_idle_previews_the_raw_frame_without_detecting() -> None:
     """The preview is a viewfinder: no encoder, no features, no scoring."""
-    controller = create_autospec(IController, instance=True)
     encoder = make_encoder()
-    supervisor = build(controller=controller, encoder=encoder)
+    supervisor = build(encoder=encoder)
 
     supervisor.tick()
 
     encoder.encode.assert_not_called()
     assert supervisor.processed_frame_count == 0
-    pushed = controller.publish_frame.call_args[0][0]
-    assert np.array_equal(pushed, RAW_FRAME)
+    assert np.array_equal(supervisor.latest_frame, RAW_FRAME)
 
 
-def test_start_moves_to_collecting_and_clears_the_alarm_panel() -> None:
-    controller = create_autospec(IController, instance=True)
-    supervisor = build(controller=controller)
+def test_start_moves_to_collecting_and_begins_a_new_run() -> None:
+    """The run id is how a UI knows the previous run's alarms are stale -
+    nobody has to be told to forget them."""
+    supervisor = build()
+    before = supervisor.build_status().run_id
 
     supervisor.request_start()
     pump(supervisor)
 
     assert supervisor.state == SupervisorState.COLLECTING_DATA
-    controller.clear_alarms.assert_called_once()
+    assert supervisor.build_status().run_id == before + 1
+
+
+def test_stop_keeps_the_run_id() -> None:
+    """STOP discards the baseline but keeps the panel: the alarms of the run
+    that just ended are still the alarms worth looking at."""
+    supervisor = build()
+    supervisor.request_start()
+    pump(supervisor)
+    after_start = supervisor.build_status().run_id
+
+    supervisor.request_stop()
+    pump(supervisor)
+
+    assert supervisor.build_status().run_id == after_start
+
+
+def test_a_failed_start_does_not_begin_a_new_run() -> None:
+    """A camera that will not open never scanned, so it never invalidated
+    what the panel is showing."""
+
+    def factory(camera: int | str) -> IVideoSource:
+        raise RuntimeError("device busy")
+
+    supervisor = Supervisor(
+        video_source_factory=factory,
+        video_encoder=make_encoder(),
+        feature_encoder=DummyFeatureEncoder(),
+        anomaly_detector=IsolationForestAnomalyDetector(),
+        alarm_handler=ConsoleLoggerAlarmHandler(),
+        camera=7,
+    )
+    supervisor.initialize()
+    before = supervisor.build_status().run_id
+
+    supervisor.request_start()
+    pump(supervisor)
+
+    assert supervisor.build_status().run_id == before
 
 
 def test_start_resets_tracking_state() -> None:
@@ -115,16 +150,14 @@ def test_start_resets_tracking_state() -> None:
 
 
 def test_scanning_uses_the_annotated_frame() -> None:
-    controller = create_autospec(IController, instance=True)
-    supervisor = build(controller=controller)
+    supervisor = build()
     supervisor.request_start()
     pump(supervisor)
 
     supervisor.tick()
 
     assert supervisor.processed_frame_count == 1
-    pushed = controller.publish_frame.call_args[0][0]
-    assert np.array_equal(pushed, ANNOTATED_FRAME)
+    assert np.array_equal(supervisor.latest_frame, ANNOTATED_FRAME)
 
 
 def test_stop_returns_to_idle_and_discards_progress() -> None:
@@ -197,7 +230,6 @@ def test_failing_camera_keeps_the_system_idle_with_an_error() -> None:
         feature_encoder=DummyFeatureEncoder(),
         anomaly_detector=IsolationForestAnomalyDetector(),
         alarm_handler=ConsoleLoggerAlarmHandler(),
-        controller=None,
         camera=7,
     )
     supervisor.initialize()

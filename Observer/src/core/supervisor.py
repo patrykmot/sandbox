@@ -3,10 +3,14 @@
 The coordinator that manages lifecycle, state-machine transitions, and the
 per-frame execution loop tying every interface-driven component together.
 
-It is also the IControlTarget the UI talks to. Commands (START / STOP /
-select camera) are queued by whatever thread calls them and applied here, at
-the top of a loop pass - so a click in the browser never touches OpenCV or
-model state mid-frame.
+It knows nothing about a UI. Whatever displays the system *pulls* what it
+needs - `build_status()` and `latest_frame` - and *requests* the three things
+it may change. Those requests (START / STOP / select camera) are queued by
+whatever thread calls them and applied here, at the top of a loop pass, so a
+click in the browser never touches OpenCV or model state mid-frame.
+
+Alarms go out through the injected IAlarmHandler, which is the one and only
+way an event leaves this class.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ if TYPE_CHECKING:
     from src.implementations.feature_vector_csv_writer import FeatureVectorCsvWriter
 
 from src.interfaces.alarm import AlarmEvent, IAlarmHandler
-from src.interfaces.controller import IController, IControlTarget, SystemStatus
+from src.interfaces.controller import SystemStatus
 from src.interfaces.detector import IAnomalyDetector
 from src.interfaces.encoder import FeatureVector, IFeatureEncoder, IVideoEncoder
 from src.interfaces.state import SupervisorState
@@ -38,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 # Re-exported so existing `from src.core.supervisor import SupervisorState`
 # imports keep working; the enum itself lives in the interfaces layer so that
-# IController can reference it without depending on core.
+# ISupervisorPort can reference it without depending on core.
 __all__ = ["Supervisor", "SupervisorState"]
 
 #: Pause between loop passes when there is no camera to read from (failed
@@ -47,22 +51,24 @@ __all__ = ["Supervisor", "SupervisorState"]
 _WAIT_SECONDS = 0.5
 
 
-class Supervisor(IControlTarget):
+class Supervisor:
     """Runs the core video -> vectors -> features -> detection loop and owns
     the system's state machine.
 
     Any implementation of IVideoSource / IVideoEncoder / IFeatureEncoder /
-    IAnomalyDetector / IAlarmHandler / IController can be swapped in via the
-    constructor - the Supervisor only depends on the interfaces.
+    IAnomalyDetector / IAlarmHandler can be swapped in via the constructor -
+    the Supervisor only depends on the interfaces. It satisfies
+    ISupervisorPort structurally, without importing or inheriting anything
+    from the UI side.
 
     Video sources are built through a factory rather than handed in ready-made,
     because the operator picks the camera at runtime: the Supervisor opens,
     releases and reopens sources as the selection changes.
 
-    Thread-safety: `latest_frame` and `state` are updated behind a lock,
-    commands arrive on a queue, and everything an operator UI needs is pushed
-    to the optional IController - so `run_forever()` can be driven from a
-    background thread while a web server serves requests on the main thread.
+    Thread-safety: mutable state is updated behind a lock, commands arrive on
+    a queue, and every read a UI needs is a lock-guarded snapshot - so
+    `run_forever()` can be driven from a background thread while a web server
+    serves requests on the main thread.
     """
 
     def __init__(
@@ -73,7 +79,6 @@ class Supervisor(IControlTarget):
         anomaly_detector: IAnomalyDetector,
         alarm_handler: IAlarmHandler,
         collection_target_value: int = 1000,
-        controller: IController | None = None,
         feature_csv_writer: "FeatureVectorCsvWriter | None" = None,
         camera: int | str = 0,
     ) -> None:
@@ -83,14 +88,14 @@ class Supervisor(IControlTarget):
         self._anomaly_detector = anomaly_detector
         self._alarm_handler = alarm_handler
         self._collection_target_value = collection_target_value
-        self._controller = controller
         self._feature_csv_writer = feature_csv_writer
 
         self._training_buffer: list[list[FeatureVector]] = []
         self._processed_frame_count = 0
         self._total_alarms = 0
+        self._run_id = 0
 
-        self._commands: queue.Queue[tuple[str, object]] = queue.Queue() # TODO: Do we really need this?
+        self._commands: queue.Queue[tuple[str, object]] = queue.Queue()
         self._shutdown = threading.Event()
 
         self._lock = threading.Lock()
@@ -141,18 +146,32 @@ class Supervisor(IControlTarget):
         return self._total_alarms
 
     def build_status(self) -> SystemStatus:
-        """Snapshot the Supervisor's public state for the controller/UI."""
+        """Snapshot the Supervisor's public state for whatever is displaying it.
+
+        Called from another thread now that the UI pulls rather than being
+        pushed to, so every field is read in one lock acquisition - a status
+        that mixes a new state with an old frame count would be a lie.
+        """
         with self._lock:
             state, camera, error = self._state, self._camera, self._error
+            processed = self._processed_frame_count
+            total_alarms = self._total_alarms
+            run_id = self._run_id
+            collected = len(self._training_buffer)
+
+        target = self._collection_target_value
+        progress = 1.0 if target <= 0 else min(1.0, collected / target)
+
         return SystemStatus(
             state=state,
-            processed_frame_count=self._processed_frame_count,
-            collection_progress=self.collection_progress,
-            collected_count=len(self._training_buffer),
-            collection_target=self._collection_target_value,
-            total_alarms=self._total_alarms,
+            processed_frame_count=processed,
+            collection_progress=progress,
+            collected_count=collected,
+            collection_target=target,
+            total_alarms=total_alarms,
             camera=camera,
             error=error,
+            run_id=run_id,
         )
 
     def _set_state(self, new_state: SupervisorState) -> None:
@@ -167,7 +186,7 @@ class Supervisor(IControlTarget):
         if message:
             logger.error("%s", message)
 
-    # --- Commands (IControlTarget - safe to call from any thread) ---------------------
+    # --- Commands (ISupervisorPort - safe to call from any thread) --------------------
 
     def request_start(self) -> None:
         self._commands.put(("start", None))
@@ -213,11 +232,12 @@ class Supervisor(IControlTarget):
         if not self._ensure_source():
             return  # stays IDLE; _ensure_source set the error message
 
-        if self._controller is not None:
-            try:
-                self._controller.clear_alarms()
-            except Exception:
-                logger.exception("Controller.clear_alarms failed; continuing.")
+        # A new baseline means the previous run's alarms no longer mean
+        # anything. Bumping the run id says so; nobody has to be told to
+        # forget them. Deliberately not in _reset_run_state(), which STOP
+        # also calls - STOP keeps the panel.
+        with self._lock:
+            self._run_id += 1
 
         self._set_error(None)
         self._set_state(SupervisorState.COLLECTING_DATA)
@@ -315,7 +335,6 @@ class Supervisor(IControlTarget):
 
         if state == SupervisorState.ERROR:
             # Nothing to do until the operator presses STOP.
-            self._publish_status()
             self._shutdown.wait(_WAIT_SECONDS)
             return
 
@@ -329,7 +348,6 @@ class Supervisor(IControlTarget):
         feature pipeline and the detector - it is a viewfinder, not a run.
         """
         if not self._ensure_source():
-            self._publish_status()
             self._shutdown.wait(_WAIT_SECONDS)
             return
 
@@ -338,14 +356,11 @@ class Supervisor(IControlTarget):
         if not success or frame is None:
             self._close_source()
             self._set_error(f"Camera {self.camera!r} stopped delivering frames.")
-            self._publish_status()
             self._shutdown.wait(_WAIT_SECONDS)
             return
 
         with self._lock:
             self._latest_frame = frame
-        self._publish_frame(frame)
-        self._publish_status()
 
     def step(self) -> bool:
         """Execute a single iteration of the scanning loop.
@@ -356,7 +371,6 @@ class Supervisor(IControlTarget):
         """
         if not self._ensure_source():
             self._set_state(SupervisorState.ERROR)
-            self._publish_status()
             return False
 
         assert self._source is not None
@@ -366,10 +380,10 @@ class Supervisor(IControlTarget):
             self._close_source()
             self._set_error("Video source stopped delivering frames.")
             self._set_state(SupervisorState.ERROR)
-            self._publish_status()
             return False
 
-        self._processed_frame_count += 1
+        with self._lock:
+            self._processed_frame_count += 1
 
         try:
             encoded = self._video_encoder.encode(frame)
@@ -378,7 +392,6 @@ class Supervisor(IControlTarget):
             # only ever sees encoded.states.
             with self._lock:
                 self._latest_frame = encoded.annotated_frame
-            self._publish_frame(encoded.annotated_frame)
 
             features = self._feature_encoder.encode(encoded.states)
             self._write_feature_csv(features)
@@ -387,34 +400,11 @@ class Supervisor(IControlTarget):
             logger.exception("Unhandled error while processing frame; entering ERROR state.")
             self._set_error(f"Processing failed: {exc}")
             self._set_state(SupervisorState.ERROR)
-            self._publish_status()
             return False
 
-        self._publish_status()
         return True
 
-    # --- Controller push helpers ------------------------------------------------------
-    #
-    # The Supervisor knows nothing about how (or whether) this data is
-    # displayed - it just hands it to the IController implementation. A
-    # misbehaving UI must never take down the processing loop, so every push
-    # is guarded.
-
-    def _publish_status(self) -> None:
-        if self._controller is None:
-            return
-        try:
-            self._controller.publish_status(self.build_status())
-        except Exception:
-            logger.exception("Controller.publish_status failed; continuing.")
-
-    def _publish_frame(self, frame: np.ndarray) -> None:
-        if self._controller is None:
-            return
-        try:
-            self._controller.publish_frame(frame)
-        except Exception:
-            logger.exception("Controller.publish_frame failed; continuing.")
+    # --- Side channels ----------------------------------------------------------------
 
     def _write_feature_csv(self, features: list[FeatureVector]) -> None:
         """Observation-only side channel; must never disturb the pipeline."""
@@ -424,14 +414,6 @@ class Supervisor(IControlTarget):
             self._feature_csv_writer.write(features)
         except Exception:
             logger.exception("Feature CSV write failed; continuing.")
-
-    def _publish_alarm(self, event: AlarmEvent) -> None:
-        if self._controller is None:
-            return
-        try:
-            self._controller.publish_alarm(event)
-        except Exception:
-            logger.exception("Controller.publish_alarm failed; continuing.")
 
     # --- Core state-dependent branching -----------------------------------------------
 
@@ -477,7 +459,6 @@ class Supervisor(IControlTarget):
 
     def _train(self) -> None:
         self._set_state(SupervisorState.TRAINING)
-        self._publish_status()
         try:
             self._anomaly_detector.fit(self._training_buffer)
         except Exception as exc:
@@ -492,7 +473,8 @@ class Supervisor(IControlTarget):
 
         if is_anomaly:
             self._set_state(SupervisorState.ALARM_ACTIVE)
-            self._total_alarms += 1
+            with self._lock:
+                self._total_alarms += 1
             event = AlarmEvent(
                 timestamp=int(time.time() * 1000),
                 vector=features,
@@ -500,7 +482,8 @@ class Supervisor(IControlTarget):
                 description="Anomaly detected by IsolationForestAnomalyDetector.",
                 frame=self.latest_frame,
             )
+            # The one way an event leaves this class. Fan-out and per-sink
+            # isolation are the handler's job (see CompositeAlarmHandler).
             self._alarm_handler.trigger_alarm(event)
-            self._publish_alarm(event)
         else:
             self._set_state(SupervisorState.MONITORING)

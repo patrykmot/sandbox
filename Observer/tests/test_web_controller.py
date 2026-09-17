@@ -10,7 +10,6 @@ the suite still runs; install requirements.txt to exercise them.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import create_autospec
 
 import numpy as np
 import pytest
@@ -21,7 +20,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from src.implementations.web_controller import WebController  # noqa: E402
 from src.interfaces.alarm import AlarmEvent  # noqa: E402
-from src.interfaces.controller import IControlTarget, SystemStatus  # noqa: E402
+from src.interfaces.controller import ISupervisorPort, SystemStatus  # noqa: E402
 from src.interfaces.encoder import FeatureVector  # noqa: E402
 from src.interfaces.video_source import CameraOption  # noqa: E402
 from src.interfaces.state import SupervisorState  # noqa: E402
@@ -35,6 +34,7 @@ def make_status(
     target: int = 100,
     frames: int = 25,
     alarms: int = 0,
+    run_id: int = 1,
 ) -> SystemStatus:
     return SystemStatus(
         state=state,
@@ -43,6 +43,7 @@ def make_status(
         collected_count=collected,
         collection_target=target,
         total_alarms=alarms,
+        run_id=run_id,
     )
 
 
@@ -56,6 +57,37 @@ def make_alarm_event(score: float = -0.65, timestamp: int = 1_700_000_000_000) -
     )
 
 
+class FakeSupervisor:
+    """A stand-in for the real Supervisor: the ISupervisorPort surface, no loop.
+
+    The dashboard pulls, so a test only has to decide what a pull returns.
+    """
+
+    def __init__(self, status: SystemStatus | None = None) -> None:
+        self.status = status if status is not None else make_status()
+        self.latest_frame: np.ndarray | None = None
+        self.starts = 0
+        self.stops = 0
+        self.cameras: list[int | str] = []
+
+    def build_status(self) -> SystemStatus:
+        return self.status
+
+    def request_start(self) -> None:
+        self.starts += 1
+
+    def request_stop(self) -> None:
+        self.stops += 1
+
+    def request_camera(self, camera: int | str) -> None:
+        self.cameras.append(camera)
+
+
+def test_fake_supervisor_satisfies_the_port() -> None:
+    """If this drifts from the real port the HTTP tests below are fiction."""
+    assert isinstance(FakeSupervisor(), ISupervisorPort)
+
+
 @pytest.fixture()
 def controller() -> WebController:
     return WebController(max_alarms=20)
@@ -64,6 +96,18 @@ def controller() -> WebController:
 @pytest.fixture()
 def client(controller: WebController) -> TestClient:
     return TestClient(controller.app)
+
+
+@pytest.fixture()
+def supervisor() -> FakeSupervisor:
+    return FakeSupervisor()
+
+
+@pytest.fixture()
+def bound(controller: WebController, supervisor: FakeSupervisor) -> WebController:
+    """The same controller as `controller`, with a Supervisor attached."""
+    controller.bind_supervisor(supervisor)
+    return controller
 
 
 def test_index_serves_dashboard(client: TestClient) -> None:
@@ -75,18 +119,19 @@ def test_index_serves_dashboard(client: TestClient) -> None:
         assert endpoint in response.text
 
 
-def test_status_before_first_frame_is_safe(client: TestClient) -> None:
-    """The UI may poll before the Supervisor thread has produced anything."""
+def test_status_without_a_supervisor_is_safe(client: TestClient) -> None:
+    """A dashboard with nothing bound is read-only, not broken - and the page
+    may well poll before the wiring in main() has finished."""
     payload = client.get("/api/status").json()
     assert payload["state"] == SupervisorState.INITIALIZING.name
     assert payload["processed_frame_count"] == 0
     assert payload["collection_progress_percent"] == 0.0
 
 
-def test_status_reflects_published_snapshot(
-    controller: WebController, client: TestClient
+def test_status_reflects_the_supervisor_snapshot(
+    bound: WebController, supervisor: FakeSupervisor, client: TestClient
 ) -> None:
-    controller.publish_status(make_status(collected=25, target=100, frames=25))
+    supervisor.status = make_status(collected=25, target=100, frames=25)
 
     payload = client.get("/api/status").json()
     assert payload["state"] == "COLLECTING_DATA"
@@ -103,8 +148,8 @@ def test_alerts_empty_by_default(client: TestClient) -> None:
 def test_alerts_returns_newest_first_with_frame_urls(
     controller: WebController, client: TestClient
 ) -> None:
-    controller.publish_alarm(make_alarm_event(score=-0.10, timestamp=1_700_000_000_000))
-    controller.publish_alarm(make_alarm_event(score=-0.90, timestamp=1_700_000_005_000))
+    controller.trigger_alarm(make_alarm_event(score=-0.10, timestamp=1_700_000_000_000))
+    controller.trigger_alarm(make_alarm_event(score=-0.90, timestamp=1_700_000_005_000))
 
     alarms = client.get("/alerts").json()["alarms"]
     assert len(alarms) == 2
@@ -121,7 +166,7 @@ def test_alarm_panel_keeps_only_last_n(client: TestClient) -> None:
     client = TestClient(controller.app)
 
     for i in range(25):
-        controller.publish_alarm(make_alarm_event(timestamp=1_700_000_000_000 + i))
+        controller.trigger_alarm(make_alarm_event(timestamp=1_700_000_000_000 + i))
 
     alarms = client.get("/alerts").json()["alarms"]
     assert len(alarms) == 20
@@ -132,7 +177,7 @@ def test_alarm_panel_keeps_only_last_n(client: TestClient) -> None:
 def test_alarm_frame_endpoint_returns_jpeg(
     controller: WebController, client: TestClient
 ) -> None:
-    controller.publish_alarm(make_alarm_event())
+    controller.trigger_alarm(make_alarm_event())
     alarm_id = client.get("/alerts").json()["alarms"][0]["id"]
 
     response = client.get(f"/api/alarms/{alarm_id}/frame")
@@ -161,7 +206,9 @@ def test_video_feed_route_is_registered(controller: WebController) -> None:
     assert "/video_feed" in {route.path for route in controller.app.routes}
 
 
-def test_mjpeg_stream_frames_and_stops_on_disconnect(controller: WebController) -> None:
+def test_mjpeg_stream_frames_and_stops_on_disconnect(
+    bound: WebController, supervisor: FakeSupervisor
+) -> None:
     """Exercised at generator level rather than over HTTP.
 
     The MJPEG response is endless by design, so an HTTP-level test can only
@@ -170,11 +217,11 @@ def test_mjpeg_stream_frames_and_stops_on_disconnect(controller: WebController) 
     every closed browser tab leaks a spinning task), so that's asserted here
     directly.
     """
-    controller.publish_frame(FRAME)
+    supervisor.latest_frame = FRAME
     request = FakeRequest(disconnect_after=2)
 
     async def collect() -> list[bytes]:
-        return [chunk async for chunk in controller._mjpeg_stream(request)]
+        return [chunk async for chunk in bound._mjpeg_stream(request)]
 
     chunks = asyncio.run(collect())
 
@@ -188,15 +235,32 @@ def test_mjpeg_stream_frames_and_stops_on_disconnect(controller: WebController) 
 
 
 def test_mjpeg_stream_waits_without_yielding_before_first_frame(
-    controller: WebController,
+    bound: WebController,
 ) -> None:
-    """No frame published yet must not emit an empty/corrupt JPEG part."""
+    """No frame produced yet must not emit an empty/corrupt JPEG part."""
     request = FakeRequest(disconnect_after=2)
 
     async def collect() -> list[bytes]:
-        return [chunk async for chunk in controller._mjpeg_stream(request)]
+        return [chunk async for chunk in bound._mjpeg_stream(request)]
 
     assert asyncio.run(collect()) == []
+
+
+def test_a_frame_is_encoded_once_however_often_it_is_served(
+    bound: WebController, supervisor: FakeSupervisor
+) -> None:
+    """Several viewers polling faster than the loop produces frames must not
+    each pay for their own encode."""
+    supervisor.latest_frame = FRAME
+
+    first = bound._jpeg_for(FRAME)
+    again = bound._jpeg_for(FRAME)
+
+    assert first is again  # the identical bytes object, not just an equal one
+
+    # A different frame is a different encode.
+    other = bound._jpeg_for(np.zeros((32, 32, 3), dtype=np.uint8))
+    assert other is not first
 
 # --- Control endpoints ----------------------------------------------------------------
 #
@@ -206,19 +270,19 @@ def test_mjpeg_stream_waits_without_yielding_before_first_frame(
 
 
 @pytest.fixture
-def control() -> IControlTarget:
-    return create_autospec(IControlTarget, instance=True)
+def control() -> FakeSupervisor:
+    return FakeSupervisor()
 
 
 @pytest.fixture
-def wired(control: IControlTarget) -> TestClient:
+def wired(control: FakeSupervisor) -> TestClient:
     controller = WebController(
         cameras_provider=lambda active: [
             CameraOption(id=0, name="Integrated Webcam"),
             CameraOption(id=1, name="Logitech C920"),
         ]
     )
-    controller.bind_control(control)
+    controller.bind_supervisor(control)
     return TestClient(controller.app)
 
 
@@ -229,34 +293,34 @@ def test_control_endpoints_are_503_without_a_supervisor(client: TestClient) -> N
     assert client.post("/api/control/camera", json={"camera": 1}).status_code == 503
 
 
-def test_start_and_stop_are_forwarded(wired: TestClient, control: IControlTarget) -> None:
+def test_start_and_stop_are_forwarded(wired: TestClient, control: FakeSupervisor) -> None:
     assert wired.post("/api/control/start").status_code == 200
-    control.request_start.assert_called_once()
+    assert control.starts == 1
 
     assert wired.post("/api/control/stop").status_code == 200
-    control.request_stop.assert_called_once()
+    assert control.stops == 1
 
 
 def test_camera_selection_is_forwarded_as_an_index(
-    wired: TestClient, control: IControlTarget
+    wired: TestClient, control: FakeSupervisor
 ) -> None:
     """A <select> sends strings; an OpenCV index has to arrive as an int."""
     assert wired.post("/api/control/camera", json={"camera": "1"}).status_code == 200
-    control.request_camera.assert_called_once_with(1)
+    assert control.cameras == [1]
 
 
 def test_camera_selection_keeps_urls_as_strings(
-    wired: TestClient, control: IControlTarget
+    wired: TestClient, control: FakeSupervisor
 ) -> None:
     url = "rtsp://user:pass@host/stream"
     assert wired.post("/api/control/camera", json={"camera": url}).status_code == 200
-    control.request_camera.assert_called_once_with(url)
+    assert control.cameras == [url]
 
 
-def test_camera_selection_rejects_nonsense(wired: TestClient, control: IControlTarget) -> None:
+def test_camera_selection_rejects_nonsense(wired: TestClient, control: FakeSupervisor) -> None:
     assert wired.post("/api/control/camera", json={}).status_code == 422
     assert wired.post("/api/control/camera", json={"camera": ""}).status_code == 422
-    control.request_camera.assert_not_called()
+    assert control.cameras == []
 
 
 def test_camera_list_is_served(wired: TestClient) -> None:
@@ -277,8 +341,10 @@ def test_camera_list_survives_a_failing_provider() -> None:
     assert client.get("/api/cameras").json()["cameras"] == []
 
 
-def test_status_reports_camera_and_error(client: TestClient, controller: WebController) -> None:
-    controller.publish_status(
+def test_status_reports_camera_and_error(
+    client: TestClient, bound: WebController, supervisor: FakeSupervisor
+) -> None:
+    supervisor.status = (
         SystemStatus(
             state=SupervisorState.IDLE,
             processed_frame_count=0,
@@ -296,12 +362,15 @@ def test_status_reports_camera_and_error(client: TestClient, controller: WebCont
     assert payload["error"] == "Could not open camera 1."
 
 
-def test_clear_alarms_empties_the_panel(
-    client: TestClient, controller: WebController
+def test_a_new_run_hides_the_previous_runs_alarms(
+    client: TestClient, bound: WebController, supervisor: FakeSupervisor
 ) -> None:
-    controller.publish_alarm(make_alarm_event())
+    """Alarms scored against the old baseline mean nothing against the new
+    one. The run id says so; nobody tells the panel to forget them."""
+    supervisor.status = make_status(run_id=4)
+    bound.trigger_alarm(make_alarm_event())
     assert len(client.get("/alerts").json()["alarms"]) == 1
 
-    controller.clear_alarms()
+    supervisor.status = make_status(run_id=5)
 
     assert client.get("/alerts").json()["alarms"] == []

@@ -8,7 +8,9 @@ system needs to know.
 
 Threading model (Phase II requirement): the OpenCV/Supervisor processing loop
 runs on a background daemon thread so it never blocks FastAPI's event loop,
-while the controller serves the dashboard on the main thread.
+while the dashboard serves requests on the main thread. The dashboard pulls
+what it displays from the Supervisor and receives alarms as one more
+IAlarmHandler sink - the Supervisor itself knows nothing about a UI.
 
 The system boots IDLE: the selected camera is previewed, but nothing is
 detected or learned until START is pressed in the dashboard.
@@ -23,12 +25,14 @@ from src.config import Config
 from src.core.supervisor import Supervisor
 from src.implementations.camera_list import list_cameras
 from src.implementations.camera_source import CameraVideoSource
+from src.implementations.composite_alarm import CompositeAlarmHandler
 from src.implementations.console_alarm import ConsoleLoggerAlarmHandler
 from src.implementations.feature_vector_csv_writer import FeatureVectorCsvWriter
 from src.implementations.frame_merging_feature_encoder import FrameMergingFeatureEncoder
 from src.implementations.iso_forest_detector import IsolationForestAnomalyDetector
 from src.implementations.web_controller import WebController
 from src.implementations.yolo_encoder import YOLOVideoEncoder
+from src.interfaces.alarm import IAlarmHandler
 from src.interfaces.video_source import CameraOption, IVideoSource
 
 logger = logging.getLogger(__name__)
@@ -52,7 +56,7 @@ def default_camera(config: Config) -> int | str:
     return config.camera_index
 
 
-def build_supervisor(config: Config, controller: WebController | None = None) -> Supervisor:
+def build_supervisor(config: Config, alarm_handler: IAlarmHandler) -> Supervisor:
     # Component 1: Video Data Source. The operator picks the camera at
     # runtime, so the Supervisor gets a factory and opens sources itself.
     # Swap for e.g. a VideoFileSource by changing this single line.
@@ -78,10 +82,6 @@ def build_supervisor(config: Config, controller: WebController | None = None) ->
         contamination=config.isolation_forest_contamination,
     )
 
-    # Component 5: Alarm Handler. Swap for e.g. an email/SMS/webhook handler
-    # by implementing IAlarmHandler and constructing it here instead.
-    alarm_handler = ConsoleLoggerAlarmHandler()
-
     # Optional observation side channel: dumps every FeatureVector to CSV.
     # Column names are taken from the encoder when it publishes them.
     feature_csv_writer = None
@@ -99,7 +99,6 @@ def build_supervisor(config: Config, controller: WebController | None = None) ->
         anomaly_detector=anomaly_detector,
         alarm_handler=alarm_handler,
         collection_target_value=config.collection_target_value,
-        controller=controller,
         feature_csv_writer=feature_csv_writer,
         camera=default_camera(config),
     )
@@ -113,8 +112,8 @@ def main() -> None:
 
     config = Config()
 
-    # Component 7: Controller. Swap for a TUI/metrics/no-op controller by
-    # implementing IController and constructing it here instead.
+    # Component 7: the operator UI. Swap for a TUI or a metrics exporter by
+    # writing one that pulls ISupervisorPort and constructing it here instead.
     controller = WebController(
         host=config.server_host,
         port=config.server_port,
@@ -124,11 +123,20 @@ def main() -> None:
         cameras_provider=build_cameras_provider(config),
     )
 
-    supervisor = build_supervisor(config, controller)
+    # Component 5: Alarm Handlers. An alarm has more than one audience, and
+    # the composite is what keeps one failing sink from taking down the loop.
+    # Add an email/SMS/webhook sink by implementing IAlarmHandler and
+    # appending it to this list.
+    alarm_handler = CompositeAlarmHandler(
+        [ConsoleLoggerAlarmHandler(), controller]
+    )
 
-    # The dashboard drives the Supervisor through this, and only through
-    # this: requests are queued and applied on the loop's own thread.
-    controller.bind_control(supervisor)
+    supervisor = build_supervisor(config, alarm_handler)
+
+    # The dashboard reads and drives the Supervisor through this, and only
+    # through this: reads are lock-guarded snapshots, and requests are queued
+    # and applied on the loop's own thread.
+    controller.bind_supervisor(supervisor)
 
     # The processing loop MUST NOT run on the main thread - FastAPI's event
     # loop lives there. daemon=True so Ctrl+C on the server tears it down.
