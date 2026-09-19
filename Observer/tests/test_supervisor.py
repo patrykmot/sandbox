@@ -100,9 +100,12 @@ def build_supervisor(
         video_source_factory=lambda camera: video_source,
         video_encoder=video_encoder,
         feature_encoder=DummyFeatureEncoder(),
-        anomaly_detector=IsolationForestAnomalyDetector(contamination=0.05),
+        anomaly_detector_factory=lambda name: IsolationForestAnomalyDetector(
+            contamination=0.05
+        ),
         alarm_handler=alarm_handler or ConsoleLoggerAlarmHandler(),
         collection_target_value=COLLECTION_TARGET,
+        detector="isolation_forest",
     )
     # Tests drive step() directly, which is only meaningful once scanning.
     supervisor.initialize()
@@ -307,6 +310,70 @@ def test_a_failing_alarm_sink_does_not_break_processing_loop() -> None:
     assert surviving.trigger_alarm.call_count == exploding.trigger_alarm.call_count
     assert supervisor.state != SupervisorState.ERROR
     assert supervisor.processed_frame_count == total_frames
+
+
+def test_training_progress_is_reported_while_fitting() -> None:
+    """The dashboard's training bar is driven by whatever fit() reports, so
+    the Supervisor has to hand the detector a callback and keep the result."""
+    total_frames = COLLECTION_TARGET + 1
+    states = make_normal_states(total_frames)
+
+    seen: list[float] = []
+
+    class RecordingDetector(IsolationForestAnomalyDetector):
+        def fit(self, training_data, progress_callback=None):
+            super().fit(training_data)
+            for percent in (25, 50, 75):
+                progress_callback(percent)
+                # What a UI polling build_status() would read at this instant.
+                seen.append(supervisor.build_status().training_progress)
+
+    video_source = build_mock_video_source(total_frames)
+    video_encoder = build_mock_video_encoder(states)
+    supervisor = Supervisor(
+        video_source_factory=lambda camera: video_source,
+        video_encoder=video_encoder,
+        feature_encoder=DummyFeatureEncoder(),
+        anomaly_detector_factory=lambda name: RecordingDetector(contamination=0.05),
+        alarm_handler=ConsoleLoggerAlarmHandler(),
+        collection_target_value=COLLECTION_TARGET,
+    )
+    supervisor.initialize()
+    supervisor.request_start()
+    supervisor._drain_commands()
+
+    for _ in range(total_frames):
+        assert supervisor.step() is True
+
+    assert seen == [0.25, 0.50, 0.75]
+    assert supervisor.state == SupervisorState.MONITORING
+
+
+def test_a_fresh_detector_is_built_for_every_run() -> None:
+    """A run must never inherit the previous run's fitted weights."""
+    built: list[str] = []
+
+    def factory(name: str) -> IsolationForestAnomalyDetector:
+        built.append(name)
+        return IsolationForestAnomalyDetector(contamination=0.05)
+
+    supervisor = Supervisor(
+        video_source_factory=lambda camera: build_mock_video_source(1),
+        video_encoder=build_mock_video_encoder(make_normal_states(1)),
+        feature_encoder=DummyFeatureEncoder(),
+        anomaly_detector_factory=factory,
+        alarm_handler=ConsoleLoggerAlarmHandler(),
+        detector="isolation_forest",
+    )
+    supervisor.initialize()
+
+    for _ in range(2):
+        supervisor.request_start()
+        supervisor._drain_commands()
+        supervisor.request_stop()
+        supervisor._drain_commands()
+
+    assert built == ["isolation_forest", "isolation_forest"]
 
 
 if __name__ == "__main__":

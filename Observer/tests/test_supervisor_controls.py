@@ -41,6 +41,7 @@ def build(
     opened: list[int | str] | None = None,
     source: IVideoSource | None = None,
     encoder: IVideoEncoder | None = None,
+    detector_factory=None,
 ) -> Supervisor:
     source = source or make_source()
 
@@ -53,10 +54,12 @@ def build(
         video_source_factory=factory,
         video_encoder=encoder or make_encoder(),
         feature_encoder=DummyFeatureEncoder(),
-        anomaly_detector=IsolationForestAnomalyDetector(contamination=0.05),
+        anomaly_detector_factory=detector_factory
+        or (lambda name: IsolationForestAnomalyDetector(contamination=0.05)),
         alarm_handler=ConsoleLoggerAlarmHandler(),
         collection_target_value=10,
         camera=0,
+        detector="isolation_forest",
     )
     supervisor.initialize()
     return supervisor
@@ -125,7 +128,7 @@ def test_a_failed_start_does_not_begin_a_new_run() -> None:
         video_source_factory=factory,
         video_encoder=make_encoder(),
         feature_encoder=DummyFeatureEncoder(),
-        anomaly_detector=IsolationForestAnomalyDetector(),
+        anomaly_detector_factory=lambda name: IsolationForestAnomalyDetector(),
         alarm_handler=ConsoleLoggerAlarmHandler(),
         camera=7,
     )
@@ -190,6 +193,66 @@ def test_camera_can_be_changed_while_idle() -> None:
     assert opened == [0, 2]
 
 
+def test_detector_can_be_changed_while_idle() -> None:
+    built: list[str] = []
+    supervisor = build(
+        detector_factory=lambda name: built.append(name)
+        or IsolationForestAnomalyDetector(contamination=0.05)
+    )
+
+    supervisor.request_detector("autoencoder")
+    pump(supervisor)
+
+    assert supervisor.detector == "autoencoder"
+    assert supervisor.build_status().detector == "autoencoder"
+
+    # The choice only takes effect at START - that is when it is built.
+    assert built == []
+    supervisor.request_start()
+    pump(supervisor)
+    assert built == ["autoencoder"]
+
+
+def test_detector_change_is_ignored_while_scanning() -> None:
+    """Which model learned the baseline is inseparable from the baseline, so
+    the dropdown locks exactly as the camera one does."""
+    supervisor = build()
+    supervisor.request_start()
+    pump(supervisor)
+
+    supervisor.request_detector("autoencoder")
+    pump(supervisor)
+
+    assert supervisor.detector == "isolation_forest"
+
+
+def test_a_detector_that_will_not_build_keeps_the_system_idle() -> None:
+    """An unknown id is a bad choice, not a broken system - say so and stay
+    IDLE so another one can be picked."""
+
+    def factory(name: str):
+        raise ValueError(f"Unknown detector {name!r}.")
+
+    supervisor = build(detector_factory=factory)
+
+    supervisor.request_start()
+    pump(supervisor)
+
+    assert supervisor.state == SupervisorState.IDLE
+    assert "Unknown detector" in (supervisor.error or "")
+
+
+def test_start_resets_training_progress() -> None:
+    supervisor = build()
+    supervisor._set_training_progress(80)
+    assert supervisor.build_status().training_progress == 0.8
+
+    supervisor.request_start()
+    pump(supervisor)
+
+    assert supervisor.build_status().training_progress == 0.0
+
+
 def test_camera_change_is_ignored_while_scanning() -> None:
     """The camera is part of what the model learned, so it is locked once
     scanning starts - the UI disables the dropdown for the same reason."""
@@ -228,7 +291,7 @@ def test_failing_camera_keeps_the_system_idle_with_an_error() -> None:
         video_source_factory=factory,
         video_encoder=make_encoder(),
         feature_encoder=DummyFeatureEncoder(),
-        anomaly_detector=IsolationForestAnomalyDetector(),
+        anomaly_detector_factory=lambda name: IsolationForestAnomalyDetector(),
         alarm_handler=ConsoleLoggerAlarmHandler(),
         camera=7,
     )

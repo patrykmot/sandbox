@@ -23,6 +23,7 @@ import threading
 
 from src.config import Config
 from src.core.supervisor import Supervisor
+from src.implementations.autoencoder_detector import PyTorchAutoencoderDetector
 from src.implementations.camera_list import list_cameras
 from src.implementations.camera_source import CameraVideoSource
 from src.implementations.composite_alarm import CompositeAlarmHandler
@@ -33,9 +34,56 @@ from src.implementations.iso_forest_detector import IsolationForestAnomalyDetect
 from src.implementations.web_controller import WebController
 from src.implementations.yolo_encoder import YOLOVideoEncoder
 from src.interfaces.alarm import IAlarmHandler
+from src.interfaces.detector import DetectorOption, IAnomalyDetector
 from src.interfaces.video_source import CameraOption, IVideoSource
 
 logger = logging.getLogger(__name__)
+
+
+# Component 3: the selectable Anomaly Detectors. This table is the single
+# place that maps a dashboard dropdown entry to a constructor - add an
+# implementation of IAnomalyDetector here and it appears in the UI. The
+# operator picks one per run, so these are built on START rather than now.
+DETECTORS: dict[str, str] = {
+    "isolation_forest": "Isolation Forest (scikit-learn)",
+    "autoencoder": "Autoencoder (PyTorch)",
+}
+
+
+def build_detectors_provider(config: Config):
+    """Returns the callable the dashboard uses to fill its detector dropdown."""
+
+    def provider() -> list[DetectorOption]:
+        return [DetectorOption(id=key, name=name) for key, name in DETECTORS.items()]
+
+    return provider
+
+
+def build_detector_factory(config: Config):
+    """Returns the callable the Supervisor uses to build the selected detector.
+
+    An unknown id raises rather than quietly falling back: the Supervisor
+    reports it and stays IDLE, which is visible, where a silent substitution
+    would have the dashboard claim one detector while another ran.
+    """
+
+    def factory(detector: str) -> IAnomalyDetector:
+        if detector == "isolation_forest":
+            return IsolationForestAnomalyDetector(
+                contamination=config.isolation_forest_contamination,
+            )
+        if detector == "autoencoder":
+            return PyTorchAutoencoderDetector(
+                hidden_dim=config.autoencoder_hidden_dim,
+                latent_dim=config.autoencoder_latent_dim,
+                epochs=config.autoencoder_epochs,
+                batch_size=config.autoencoder_batch_size,
+                learning_rate=config.autoencoder_learning_rate,
+                percentile_threshold=config.autoencoder_percentile_threshold,
+            )
+        raise ValueError(f"Unknown detector {detector!r}. Known: {sorted(DETECTORS)}.")
+
+    return factory
 
 
 def build_cameras_provider(config: Config):
@@ -77,11 +125,6 @@ def build_supervisor(config: Config, alarm_handler: IAlarmHandler) -> Supervisor
     # DummyFeatureEncoder here for one vector per object instead.
     feature_encoder = FrameMergingFeatureEncoder()
 
-    # Component 3: Anomaly Detector.
-    anomaly_detector = IsolationForestAnomalyDetector(
-        contamination=config.isolation_forest_contamination,
-    )
-
     # Optional observation side channel: dumps every FeatureVector to CSV.
     # Column names are taken from the encoder when it publishes them.
     feature_csv_writer = None
@@ -96,11 +139,12 @@ def build_supervisor(config: Config, alarm_handler: IAlarmHandler) -> Supervisor
         video_source_factory=video_source_factory,
         video_encoder=video_encoder,
         feature_encoder=feature_encoder,
-        anomaly_detector=anomaly_detector,
+        anomaly_detector_factory=build_detector_factory(config),
         alarm_handler=alarm_handler,
         collection_target_value=config.collection_target_value,
         feature_csv_writer=feature_csv_writer,
         camera=default_camera(config),
+        detector=config.default_detector,
     )
 
 
@@ -121,6 +165,7 @@ def main() -> None:
         stream_fps=config.dashboard_stream_fps,
         jpeg_quality=config.dashboard_jpeg_quality,
         cameras_provider=build_cameras_provider(config),
+        detectors_provider=build_detectors_provider(config),
     )
 
     # Component 5: Alarm Handlers. An alarm has more than one audience, and
@@ -148,10 +193,12 @@ def main() -> None:
     processing_thread.start()
 
     logger.info(
-        "Observer ready on http://%s:%d/ - previewing camera %r, press Start to collect %d frames.",
+        "Observer ready on http://%s:%d/ - previewing camera %r, detector %r, "
+        "press Start to collect %d frames.",
         config.server_host,
         config.server_port,
         supervisor.camera,
+        supervisor.detector,
         config.collection_target_value,
     )
 

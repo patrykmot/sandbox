@@ -36,6 +36,7 @@ from fastapi.staticfiles import StaticFiles
 
 from src.interfaces.alarm import AlarmEvent, IAlarmHandler
 from src.interfaces.controller import ISupervisorPort, SystemStatus
+from src.interfaces.detector import DetectorOption
 from src.interfaces.state import SupervisorState
 from src.interfaces.video_source import CameraOption
 
@@ -80,6 +81,7 @@ class WebController(IAlarmHandler):
         jpeg_quality: int = 80,
         supervisor: ISupervisorPort | None = None,
         cameras_provider: Callable[[int | str | None], list[CameraOption]] | None = None,
+        detectors_provider: Callable[[], list[DetectorOption]] | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -88,6 +90,7 @@ class WebController(IAlarmHandler):
         # endpoints report 503.
         self._supervisor = supervisor
         self._cameras_provider = cameras_provider
+        self._detectors_provider = detectors_provider
         self._stream_interval = 1.0 / max(1, stream_fps)
         self._jpeg_params = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
 
@@ -168,6 +171,17 @@ class WebController(IAlarmHandler):
             raise HTTPException(status_code=503, detail="This dashboard is read-only.")
         return self._supervisor
 
+    def _available_detectors(self) -> list[DetectorOption]:
+        """What the dropdown offers. An empty list means nothing was wired,
+        in which case selection is not validated rather than refused."""
+        if self._detectors_provider is None:
+            return []
+        try:
+            return list(self._detectors_provider())
+        except Exception:
+            logger.exception("Listing detectors failed; returning an empty list.")
+            return []
+
     def _current_status(self) -> SystemStatus | None:
         """The Supervisor's own snapshot, or None when nothing is bound."""
         if self._supervisor is None:
@@ -191,6 +205,9 @@ class WebController(IAlarmHandler):
                 "total_alarms": total_alarms,
                 "camera": None,
                 "error": None,
+                "detector": None,
+                "training_progress": 0.0,
+                "training_progress_percent": 0.0,
             }
 
         return {
@@ -203,6 +220,9 @@ class WebController(IAlarmHandler):
             "total_alarms": status.total_alarms,
             "camera": status.camera,
             "error": status.error,
+            "detector": status.detector,
+            "training_progress": status.training_progress,
+            "training_progress_percent": round(status.training_progress * 100, 1),
         }
 
     async def _mjpeg_stream(self, request: Request):
@@ -295,6 +315,32 @@ class WebController(IAlarmHandler):
             camera = _coerce_camera(payload["camera"])
             self._require_supervisor().request_camera(camera)
             return {"requested": "camera", "camera": camera}
+
+        @app.get("/api/detectors")
+        def api_detectors() -> dict:
+            status = self._current_status()
+            return {
+                "detectors": [
+                    {"id": d.id, "name": d.name} for d in self._available_detectors()
+                ],
+                "selected": status.detector if status is not None else None,
+            }
+
+        @app.post("/api/control/detector")
+        def api_detector(payload: dict = Body(...)) -> dict:
+            detector = payload.get("detector")
+            if not isinstance(detector, str) or not detector.strip():
+                raise HTTPException(status_code=422, detail="Missing 'detector'.")
+
+            # Unlike a camera id, this names a code path: an unknown one would
+            # only fail later, at START, as a puzzling error on the dashboard.
+            # Reject it here, while the operator is still looking at the click.
+            known = {d.id for d in self._available_detectors()}
+            if known and detector not in known:
+                raise HTTPException(status_code=422, detail=f"Unknown detector {detector!r}.")
+
+            self._require_supervisor().request_detector(detector)
+            return {"requested": "detector", "detector": detector}
 
         @app.get("/alerts")
         def alerts() -> dict:

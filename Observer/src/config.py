@@ -25,7 +25,7 @@ class Config(BaseSettings):
     )
 
     # --- Supervisor / data collection -------------------------------------------------
-    collection_target_value: int = 1000
+    collection_target_value: int = 3000
     """Number of feature vectors to collect during COLLECTING_DATA before training."""
 
     # --- Video source --------------------------------------------------------------
@@ -40,7 +40,7 @@ class Config(BaseSettings):
     answer - raise it if a camera sits on a higher index."""
 
     # --- Web dashboard ---------------------------------------------------------------
-    server_host: str = "0.0.0.0"
+    server_host: str = "localhost"
     server_port: int = 8000
     dashboard_max_alarms: int = 20
     """How many recent alarm events (with frame snapshots) the panel keeps."""
@@ -50,12 +50,27 @@ class Config(BaseSettings):
 
     # --- Video encoder (YOLO) -------------------------------------------------------
     yolo_model_path: str = "yolov8n.pt"
-    yolo_confidence: float = 0.25
+    yolo_confidence: float = 0.51
     yolo_tracker: str = "bytetrack.yaml"
 
     # --- Anomaly detector ------------------------------------------------------------
-    isolation_forest_contamination: float = 0.05
+    default_detector: str = "isolation_forest"
+    """Which detector a run trains with until the dashboard says otherwise.
+    One of the ids in main.DETECTORS."""
+
+    isolation_forest_contamination: float = 0.0000001
     model_save_path: str = "models/isolation_forest.joblib"
+
+    autoencoder_hidden_dim: int = 32
+    autoencoder_latent_dim: int = 8
+    """Bottleneck width. Narrower forces the model to generalise harder, so
+    unusual frames reconstruct worse - but too narrow and normal ones do too."""
+    autoencoder_epochs: int = 50
+    autoencoder_batch_size: int = 32
+    autoencoder_learning_rate: float = 1e-3
+    autoencoder_percentile_threshold: float = 0.99
+    """Where the alarm line sits, as a FRACTION: 0.99 means "the error 99% of
+    training frames stayed below". Lower it to catch more and alarm more."""
 
     # --- Feature inspection ----------------------------------------------------------
     feature_csv_enabled: bool = True

@@ -1,6 +1,7 @@
 opencv-python
 ultralytics
 scikit-learn
+torch
 fastapi
 uvicorn
 numpy

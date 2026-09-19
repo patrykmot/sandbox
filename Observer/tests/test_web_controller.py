@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from src.implementations.web_controller import WebController  # noqa: E402
 from src.interfaces.alarm import AlarmEvent  # noqa: E402
 from src.interfaces.controller import ISupervisorPort, SystemStatus  # noqa: E402
+from src.interfaces.detector import DetectorOption  # noqa: E402
 from src.interfaces.encoder import FeatureVector  # noqa: E402
 from src.interfaces.video_source import CameraOption  # noqa: E402
 from src.interfaces.state import SupervisorState  # noqa: E402
@@ -35,6 +36,8 @@ def make_status(
     frames: int = 25,
     alarms: int = 0,
     run_id: int = 1,
+    detector: str = "isolation_forest",
+    training_progress: float = 0.0,
 ) -> SystemStatus:
     return SystemStatus(
         state=state,
@@ -43,6 +46,8 @@ def make_status(
         collected_count=collected,
         collection_target=target,
         total_alarms=alarms,
+        detector=detector,
+        training_progress=training_progress,
         run_id=run_id,
     )
 
@@ -69,6 +74,7 @@ class FakeSupervisor:
         self.starts = 0
         self.stops = 0
         self.cameras: list[int | str] = []
+        self.detectors: list[str] = []
 
     def build_status(self) -> SystemStatus:
         return self.status
@@ -81,6 +87,9 @@ class FakeSupervisor:
 
     def request_camera(self, camera: int | str) -> None:
         self.cameras.append(camera)
+
+    def request_detector(self, detector: str) -> None:
+        self.detectors.append(detector)
 
 
 def test_fake_supervisor_satisfies_the_port() -> None:
@@ -114,8 +123,8 @@ def test_index_serves_dashboard(client: TestClient) -> None:
     response = client.get("/")
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
-    # The dashboard must wire up the three data sources it depends on.
-    for endpoint in ("/video_feed", "/api/status", "/alerts"):
+    # The dashboard must wire up the data sources it depends on.
+    for endpoint in ("/video_feed", "/api/status", "/alerts", "/api/detectors"):
         assert endpoint in response.text
 
 
@@ -280,7 +289,11 @@ def wired(control: FakeSupervisor) -> TestClient:
         cameras_provider=lambda active: [
             CameraOption(id=0, name="Integrated Webcam"),
             CameraOption(id=1, name="Logitech C920"),
-        ]
+        ],
+        detectors_provider=lambda: [
+            DetectorOption(id="isolation_forest", name="Isolation Forest (scikit-learn)"),
+            DetectorOption(id="autoencoder", name="Autoencoder (PyTorch)"),
+        ],
     )
     controller.bind_supervisor(control)
     return TestClient(controller.app)
@@ -291,6 +304,7 @@ def test_control_endpoints_are_503_without_a_supervisor(client: TestClient) -> N
     assert client.post("/api/control/start").status_code == 503
     assert client.post("/api/control/stop").status_code == 503
     assert client.post("/api/control/camera", json={"camera": 1}).status_code == 503
+    assert client.post("/api/control/detector", json={"detector": "x"}).status_code == 503
 
 
 def test_start_and_stop_are_forwarded(wired: TestClient, control: FakeSupervisor) -> None:
@@ -321,6 +335,51 @@ def test_camera_selection_rejects_nonsense(wired: TestClient, control: FakeSuper
     assert wired.post("/api/control/camera", json={}).status_code == 422
     assert wired.post("/api/control/camera", json={"camera": ""}).status_code == 422
     assert control.cameras == []
+
+
+def test_detector_list_is_served_with_the_current_selection(
+    wired: TestClient, control: FakeSupervisor
+) -> None:
+    control.status = make_status(detector="autoencoder")
+
+    payload = wired.get("/api/detectors").json()
+    assert payload["detectors"] == [
+        {"id": "isolation_forest", "name": "Isolation Forest (scikit-learn)"},
+        {"id": "autoencoder", "name": "Autoencoder (PyTorch)"},
+    ]
+    assert payload["selected"] == "autoencoder"
+
+
+def test_detector_selection_is_forwarded(
+    wired: TestClient, control: FakeSupervisor
+) -> None:
+    assert wired.post("/api/control/detector", json={"detector": "autoencoder"}).status_code == 200
+    assert control.detectors == ["autoencoder"]
+
+
+def test_detector_selection_rejects_an_unknown_id(
+    wired: TestClient, control: FakeSupervisor
+) -> None:
+    """An unknown id names a code path that does not exist. Caught here it is
+    a red box under the dropdown; passed through it would be a puzzling
+    failure at START, long after the click."""
+    assert wired.post("/api/control/detector", json={"detector": "svm"}).status_code == 422
+    assert wired.post("/api/control/detector", json={}).status_code == 422
+    assert wired.post("/api/control/detector", json={"detector": " "}).status_code == 422
+    assert control.detectors == []
+
+
+def test_training_progress_reaches_the_payload(
+    client: TestClient, bound: WebController, supervisor: FakeSupervisor
+) -> None:
+    supervisor.status = make_status(
+        state=SupervisorState.TRAINING, training_progress=0.42, detector="autoencoder"
+    )
+
+    payload = client.get("/api/status").json()
+    assert payload["state"] == "TRAINING"
+    assert payload["detector"] == "autoencoder"
+    assert payload["training_progress_percent"] == 42.0
 
 
 def test_camera_list_is_served(wired: TestClient) -> None:

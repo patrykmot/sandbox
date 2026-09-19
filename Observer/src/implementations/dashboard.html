@@ -78,13 +78,27 @@
             <div id="progress-bar" class="progress-bar bg-secondary" role="progressbar" style="width: 0%">0%</div>
           </div>
           <div class="hint mt-2 mono" id="progress-detail">0 / 0 frames</div>
+
+          <div id="training-block" hidden>
+            <div class="stat-label mb-2 mt-4">Training progress</div>
+            <div class="progress" style="height: 1.25rem;">
+              <div id="training-bar" class="progress-bar progress-bar-striped progress-bar-animated bg-warning text-dark"
+                   role="progressbar" style="width: 0%">0%</div>
+            </div>
+            <div class="hint mt-2" id="training-detail">Fitting the model&hellip;</div>
+          </div>
         </div>
       </div>
 
       <!-- Camera + the one steering button -->
       <div class="card">
-        <div class="card-header">Camera &amp; Control</div>
+        <div class="card-header">Detector, Camera &amp; Control</div>
         <div class="card-body">
+          <label class="stat-label d-block mb-2" for="detector-select">Anomaly detector</label>
+          <select id="detector-select" class="form-select mb-3">
+            <option>Loading&hellip;</option>
+          </select>
+
           <label class="stat-label d-block mb-2" for="camera-select">Camera</label>
           <select id="camera-select" class="form-select mb-2">
             <option>Loading&hellip;</option>
@@ -183,6 +197,16 @@
         data.collection_target.toLocaleString() + ' frames'
       );
 
+      // The training bar only means anything while a model is being fitted,
+      // and one detector (Isolation Forest) has no intermediate progress to
+      // report - so it jumps straight to 100 rather than creeping.
+      const training = data.state === 'TRAINING';
+      $('#training-block').prop('hidden', !training);
+      if (training) {
+        const tpct = data.training_progress_percent;
+        $('#training-bar').css('width', tpct + '%').text(tpct + '%');
+      }
+
       // Once collection is done the bar is static, not "in progress".
       if (data.state === 'COLLECTING_DATA') {
         $('#progress-bar').addClass('progress-bar-animated progress-bar-striped bg-info').removeClass('bg-success bg-secondary');
@@ -198,7 +222,7 @@
       // the list is worth nothing during a scan - so refresh it exactly when
       // we arrive back at IDLE.
       if (data.state !== lastState) {
-        if (isIdle(data.state)) { loadCameras(data.camera); }
+        if (isIdle(data.state)) { loadCameras(data.camera); loadDetectors(data.detector); }
         // A new state means a freshly opened camera: give the picture
         // another go, which is what recovers the view after an error.
         if (!data.error) { reloadStream(); }
@@ -217,11 +241,14 @@
         .addClass(idle ? 'btn-success' : 'btn-danger')
         .text(idle ? 'Start' : 'Stop');
       $('#camera-select').prop('disabled', !idle);
+      // The detector is part of what the run learned, so it locks with the
+      // camera for the same reason.
+      $('#detector-select').prop('disabled', !idle);
     }
 
     $('#camera-hint').text(idle
       ? 'Live preview only — press Start to learn this scene.'
-      : 'Press Stop to choose a different camera.');
+      : 'Press Stop to choose a different camera or detector.');
 
     if (data.error) {
       $('#error-box').text(data.error).prop('hidden', false);
@@ -278,6 +305,43 @@
         select.val(String(cameras[0].id));
         sendCamera(select.val());
       }
+    });
+  }
+
+  function loadDetectors(selected) {
+    $.getJSON('/api/detectors', function (data) {
+      const select = $('#detector-select');
+      const detectors = data.detectors || [];
+
+      if (!detectors.length) {
+        select.empty().append($('<option>').text('None available')).prop('disabled', true);
+        return;
+      }
+
+      select.empty();
+      detectors.forEach(function (detector) {
+        select.append($('<option>').attr('value', detector.id).text(detector.name));
+      });
+
+      const wanted = selected || data.selected || detectors[0].id;
+      if (select.find('option[value="' + wanted + '"]').length) {
+        select.val(wanted);
+      } else {
+        select.val(detectors[0].id);
+      }
+    });
+  }
+
+  function sendDetector(value) {
+    return $.ajax({
+      url: '/api/control/detector',
+      method: 'POST',
+      contentType: 'application/json',
+      data: JSON.stringify({ detector: value })
+    }).fail(function (xhr) {
+      $('#error-box').text('Could not select that detector: ' +
+                           (xhr.responseJSON?.detail || xhr.statusText))
+                     .prop('hidden', false);
     });
   }
 
@@ -366,6 +430,10 @@
   const liveView = document.getElementById('live-view');
   if (liveView.complete && liveView.naturalWidth === 0) { streamFailed(); }
 
+  $('#detector-select').on('change', function () {
+    sendDetector($(this).val()).always(refreshStatus);
+  });
+
   $('#camera-select').on('change', function () {
     sendCamera($(this).val()).always(function () {
       reloadStream();   // point the preview at the newly selected camera
@@ -379,6 +447,7 @@
   });
 
   loadCameras(null);
+  loadDetectors(null);
   refreshStatus();
   refreshAlerts();
   setInterval(refreshStatus, 1000);

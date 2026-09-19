@@ -38,6 +38,9 @@ class SystemStatus:
         total_alarms: Total alarms raised since the last START.
         camera: Id of the currently selected video source, if any.
         error: Last error message, cleared on the next successful START/STOP.
+        detector: Id of the anomaly-detector implementation this run uses.
+        training_progress: TRAINING progress as a 0.0-1.0 fraction. Reset to
+            0.0 by START; meaningless outside TRAINING.
         run_id: Incremented on every successful START. Identifies the baseline
             a given alarm was scored against, so a UI can tell this run's
             alarms from a previous run's without being told to forget them.
@@ -51,6 +54,8 @@ class SystemStatus:
     total_alarms: int
     camera: int | str | None = None
     error: str | None = None
+    detector: str = ""
+    training_progress: float = 0.0
     run_id: int = 0
 
 
@@ -82,4 +87,8 @@ class ISupervisorPort(Protocol):
 
     def request_camera(self, camera: int | str) -> None:
         """Select a different video source (IDLE only)."""
+        ...
+
+    def request_detector(self, detector: str) -> None:
+        """Select a different anomaly-detector implementation (IDLE only)."""
         ...

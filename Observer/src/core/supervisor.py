@@ -61,9 +61,11 @@ class Supervisor:
     ISupervisorPort structurally, without importing or inheriting anything
     from the UI side.
 
-    Video sources are built through a factory rather than handed in ready-made,
-    because the operator picks the camera at runtime: the Supervisor opens,
-    releases and reopens sources as the selection changes.
+    Video sources and anomaly detectors are both built through factories
+    rather than handed in ready-made, because the operator picks them at
+    runtime: the Supervisor opens, releases and reopens sources as the camera
+    selection changes, and builds a fresh detector for every run so a scan
+    never inherits the previous one's fitted weights.
 
     Thread-safety: mutable state is updated behind a lock, commands arrive on
     a queue, and every read a UI needs is a lock-guarded snapshot - so
@@ -76,16 +78,17 @@ class Supervisor:
         video_source_factory: Callable[[int | str], IVideoSource],
         video_encoder: IVideoEncoder,
         feature_encoder: IFeatureEncoder,
-        anomaly_detector: IAnomalyDetector,
+        anomaly_detector_factory: Callable[[str], IAnomalyDetector],
         alarm_handler: IAlarmHandler,
         collection_target_value: int = 1000,
         feature_csv_writer: "FeatureVectorCsvWriter | None" = None,
         camera: int | str = 0,
+        detector: str = "",
     ) -> None:
         self._video_source_factory = video_source_factory
         self._video_encoder = video_encoder
         self._feature_encoder = feature_encoder
-        self._anomaly_detector = anomaly_detector
+        self._anomaly_detector_factory = anomaly_detector_factory
         self._alarm_handler = alarm_handler
         self._collection_target_value = collection_target_value
         self._feature_csv_writer = feature_csv_writer
@@ -93,6 +96,7 @@ class Supervisor:
         self._training_buffer: list[list[FeatureVector]] = []
         self._processed_frame_count = 0
         self._total_alarms = 0
+        self._training_progress = 0.0
         self._run_id = 0
 
         self._commands: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -103,7 +107,10 @@ class Supervisor:
         self._latest_frame: np.ndarray | None = None
         self._source: IVideoSource | None = None
         self._camera: int | str = camera
+        self._detector: str = detector
         self._error: str | None = None
+        #: Built lazily, and rebuilt on every START - see _do_start().
+        self._anomaly_detector: IAnomalyDetector | None = None
 
     # --- Public, thread-safe accessors ------------------------------------------------
 
@@ -124,6 +131,18 @@ class Supervisor:
         """The currently selected video source id."""
         with self._lock:
             return self._camera
+
+    @property
+    def detector(self) -> str:
+        """The currently selected anomaly-detector id."""
+        with self._lock:
+            return self._detector
+
+    @property
+    def training_progress(self) -> float:
+        """Fraction (0.0-1.0) of the current TRAINING run completed."""
+        with self._lock:
+            return self._training_progress
 
     @property
     def error(self) -> str | None:
@@ -156,6 +175,8 @@ class Supervisor:
             state, camera, error = self._state, self._camera, self._error
             processed = self._processed_frame_count
             total_alarms = self._total_alarms
+            detector = self._detector
+            training_progress = self._training_progress
             run_id = self._run_id
             collected = len(self._training_buffer)
 
@@ -171,6 +192,8 @@ class Supervisor:
             total_alarms=total_alarms,
             camera=camera,
             error=error,
+            detector=detector,
+            training_progress=training_progress,
             run_id=run_id,
         )
 
@@ -197,6 +220,9 @@ class Supervisor:
     def request_camera(self, camera: int | str) -> None:
         self._commands.put(("camera", camera))
 
+    def request_detector(self, detector: str) -> None:
+        self._commands.put(("detector", detector))
+
     def shutdown(self) -> None:
         """End `run_forever()` after the current pass (process teardown)."""
         self._shutdown.set()
@@ -219,6 +245,8 @@ class Supervisor:
             self._do_stop()
         elif name == "camera":
             self._do_select_camera(payload)  # type: ignore[arg-type]
+        elif name == "detector":
+            self._do_select_detector(payload)  # type: ignore[arg-type]
         else:
             logger.warning("Unknown command %r ignored.", name)
 
@@ -231,6 +259,15 @@ class Supervisor:
         self._reset_run_state()
         if not self._ensure_source():
             return  # stays IDLE; _ensure_source set the error message
+
+        # A fresh detector per run: the previous one is fitted to a baseline
+        # this run is about to throw away.
+        try:
+            self._anomaly_detector = self._anomaly_detector_factory(self.detector)
+        except Exception as exc:
+            self._anomaly_detector = None
+            self._set_error(f"Could not build detector {self.detector!r}: {exc}")
+            return  # stays IDLE, so another one can be picked
 
         # A new baseline means the previous run's alarms no longer mean
         # anything. Bumping the run id says so; nobody has to be told to
@@ -250,6 +287,23 @@ class Supervisor:
         self._set_error(None)
         self._set_state(SupervisorState.IDLE)
 
+    def _do_select_detector(self, detector: str) -> None:
+        """Pick the implementation the next run trains with.
+
+        IDLE only, for the same reason the camera is: what the model learned
+        is inseparable from which model learned it.
+        """
+        if self.state != SupervisorState.IDLE:
+            logger.info("Detector change ignored: only valid from IDLE.")
+            return
+        if detector == self.detector:
+            return
+        with self._lock:
+            self._detector = detector
+        self._set_error(None)
+        logger.info("Detector selected: %r", detector)
+        # Built by the next START.
+
     def _do_select_camera(self, camera: int | str) -> None:
         if self.state != SupervisorState.IDLE:
             logger.info("Camera change ignored: only valid from IDLE.")
@@ -266,8 +320,10 @@ class Supervisor:
     def _reset_run_state(self) -> None:
         """Forget the baseline, the counters and any per-object tracking."""
         self._training_buffer = []
-        self._processed_frame_count = 0
-        self._total_alarms = 0
+        with self._lock:
+            self._processed_frame_count = 0
+            self._total_alarms = 0
+            self._training_progress = 0.0
         try:
             self._video_encoder.reset()
         except Exception:
@@ -457,10 +513,29 @@ class Supervisor:
         sys.stdout.write("\n" if final else "")
         sys.stdout.flush()
 
+    def _set_training_progress(self, percent: int) -> None:
+        """Training's own report of how far along it is (0-100).
+
+        Called from this thread, from inside fit(). The UI sees it because it
+        *pulls* status: _train() blocks the loop, but a FastAPI thread reading
+        build_status() in the meantime is what makes the bar move.
+        """
+        with self._lock:
+            self._training_progress = max(0.0, min(1.0, percent / 100.0))
+
     def _train(self) -> None:
+        if self._anomaly_detector is None:
+            self._set_error("Cannot train: no detector was built for this run.")
+            self._set_state(SupervisorState.ERROR)
+            return
+
         self._set_state(SupervisorState.TRAINING)
+        self._set_training_progress(0)
         try:
-            self._anomaly_detector.fit(self._training_buffer)
+            self._anomaly_detector.fit(
+                self._training_buffer,
+                progress_callback=self._set_training_progress,
+            )
         except Exception as exc:
             logger.exception("Training failed; entering ERROR state.")
             self._set_error(f"Training failed: {exc}")
@@ -469,6 +544,7 @@ class Supervisor:
         self._set_state(SupervisorState.MONITORING)
 
     def _monitor(self, features: list[FeatureVector]) -> None:
+        assert self._anomaly_detector is not None  # MONITORING implies a fitted one
         is_anomaly, score = self._anomaly_detector.predict(features)
 
         if is_anomaly:
