@@ -133,7 +133,7 @@ def build_supervisor(config: Config, alarm_handler: IAlarmHandler) -> Supervisor
             path=config.feature_csv_path,
             feature_names=getattr(feature_encoder, "FEATURE_NAMES", None),
         )
-        logger.info("Writing FeatureVectors to %s", feature_csv_writer.path)
+        logger.info("Will save FeatureVectors to %s", feature_csv_writer.path)
 
     return Supervisor(
         video_source_factory=video_source_factory,

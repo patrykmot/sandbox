@@ -468,6 +468,7 @@ class Supervisor:
             return
         try:
             self._feature_csv_writer.write(features)
+            logger.info("Just wrote features to %s", self._feature_csv_writer.path)
         except Exception:
             logger.exception("Feature CSV write failed; continuing.")
 
