@@ -79,7 +79,7 @@ class IsolationForestAnomalyDetector(IAnomalyDetector):
         so the result is floored at MIN_TREES.
 
         Args:
-            dataset_size: Total number of rows/frames in training_data (N).
+            dataset_size: Total number of rows in training_data (N).
             max_samples: Number of samples per tree (S).
             coverage_percent: Desired coverage as a PERCENTAGE, strictly
                 between 0 and 100 (99.0 = 99%). 100 is excluded rather than
@@ -162,6 +162,12 @@ class IsolationForestAnomalyDetector(IAnomalyDetector):
             max_samples,
             MIN_TREES,
         )
+
+        logger.info(
+            f"Isolation forest samples taken to training = {trees_number * max_samples} from total training size = {len(x_train)} "
+            f"_contamination = {self._contamination}"
+        )
+
         model = IsolationForest(
             n_estimators=trees_number,
             max_samples=max_samples,

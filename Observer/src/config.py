@@ -59,6 +59,7 @@ class Config(BaseSettings):
     One of the ids in main.DETECTORS."""
 
     isolation_forest_contamination: float = 0.05
+    isolation_training_coverage_percent: float = 95.0
     model_save_path: str = "models/isolation_forest.joblib"
 
     autoencoder_hidden_dim: int = 32

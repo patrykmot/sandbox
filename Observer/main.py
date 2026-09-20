@@ -71,6 +71,7 @@ def build_detector_factory(config: Config):
         if detector == "isolation_forest":
             return IsolationForestAnomalyDetector(
                 contamination=config.isolation_forest_contamination,
+                n_tree_training_coverage_percent=config.isolation_training_coverage_percent,
             )
         if detector == "autoencoder":
             return PyTorchAutoencoderDetector(
