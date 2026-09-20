@@ -25,7 +25,7 @@ class Config(BaseSettings):
     )
 
     # --- Supervisor / data collection -------------------------------------------------
-    collection_target_value: int = 3000
+    collection_target_value: int = 1000
     """Number of feature vectors to collect during COLLECTING_DATA before training."""
 
     # --- Video source --------------------------------------------------------------
@@ -44,7 +44,7 @@ class Config(BaseSettings):
     server_port: int = 8000
     dashboard_max_alarms: int = 20
     """How many recent alarm events (with frame snapshots) the panel keeps."""
-    dashboard_stream_fps: int = 15
+    dashboard_stream_fps: int = 30
     """Target frame rate of the MJPEG live view."""
     dashboard_jpeg_quality: int = 80
 
@@ -58,7 +58,7 @@ class Config(BaseSettings):
     """Which detector a run trains with until the dashboard says otherwise.
     One of the ids in main.DETECTORS."""
 
-    isolation_forest_contamination: float = 0.0000001
+    isolation_forest_contamination: float = 0.05
     model_save_path: str = "models/isolation_forest.joblib"
 
     autoencoder_hidden_dim: int = 32
