@@ -20,8 +20,9 @@ import pytest
 from src.core.supervisor import Supervisor, SupervisorState
 from src.implementations.console_alarm import ConsoleLoggerAlarmHandler
 from src.implementations.dummy_feature_encoder import DummyFeatureEncoder
+from src.implementations.composite_alarm import CompositeAlarmHandler
 from src.implementations.iso_forest_detector import IsolationForestAnomalyDetector
-from src.interfaces.controller import IController
+from src.interfaces.alarm import IAlarmHandler
 from src.interfaces.encoder import EncodedFrame, IVideoEncoder, StateVector
 from src.interfaces.video_source import IVideoSource
 
@@ -88,17 +89,29 @@ def build_mock_video_encoder(state_sequence: list[list[StateVector]]) -> IVideoE
 def build_supervisor(
     video_source: IVideoSource,
     video_encoder: IVideoEncoder,
-    controller: IController | None = None,
+    alarm_handler: IAlarmHandler | None = None,
 ) -> Supervisor:
-    return Supervisor(
-        video_source=video_source,
+    """A Supervisor already past IDLE, wired to one fixed mock source.
+
+    The real system builds a source per camera selection; a test only ever
+    wants the one mock, so the factory ignores the camera id.
+    """
+    supervisor = Supervisor(
+        video_source_factory=lambda camera: video_source,
         video_encoder=video_encoder,
         feature_encoder=DummyFeatureEncoder(),
-        anomaly_detector=IsolationForestAnomalyDetector(contamination=0.05),
-        alarm_handler=ConsoleLoggerAlarmHandler(),
+        anomaly_detector_factory=lambda name: IsolationForestAnomalyDetector(
+            contamination=0.05
+        ),
+        alarm_handler=alarm_handler or ConsoleLoggerAlarmHandler(),
         collection_target_value=COLLECTION_TARGET,
-        controller=controller,
+        detector="isolation_forest",
     )
+    # Tests drive step() directly, which is only meaningful once scanning.
+    supervisor.initialize()
+    supervisor.request_start()
+    supervisor._drain_commands()  # apply it here rather than in run_forever()
+    return supervisor
 
 
 def test_reaches_monitoring_after_collection_target() -> None:
@@ -110,7 +123,6 @@ def test_reaches_monitoring_after_collection_target() -> None:
     video_encoder = build_mock_video_encoder(states)
     supervisor = build_supervisor(video_source, video_encoder)
 
-    supervisor.initialize()
     assert supervisor.state == SupervisorState.COLLECTING_DATA
 
     for _ in range(COLLECTION_TARGET):
@@ -132,7 +144,6 @@ def test_outlier_triggers_alarm() -> None:
     video_encoder = build_mock_video_encoder(states)
     supervisor = build_supervisor(video_source, video_encoder)
 
-    supervisor.initialize()
     for _ in range(outlier_index):
         assert supervisor.step() is True
     assert supervisor.state == SupervisorState.MONITORING
@@ -154,7 +165,6 @@ def test_collection_progress_is_printed_as_single_updating_line(capsys) -> None:
     video_encoder = build_mock_video_encoder(states)
     supervisor = build_supervisor(video_source, video_encoder)
 
-    supervisor.initialize()
     for _ in range(COLLECTION_TARGET):
         assert supervisor.step() is True
     assert supervisor.state == SupervisorState.MONITORING
@@ -180,7 +190,9 @@ def test_collection_progress_is_printed_as_single_updating_line(capsys) -> None:
     assert "Collecting baseline data:" not in out_after
 
 
-def test_video_source_exhaustion_stops_loop() -> None:
+def test_video_source_exhaustion_enters_error_and_releases_the_camera() -> None:
+    """A camera that stops delivering is an error the operator must see -
+    the loop parks in ERROR rather than dying quietly."""
     total_frames = 5
     states = make_normal_states(total_frames)
 
@@ -188,33 +200,50 @@ def test_video_source_exhaustion_stops_loop() -> None:
     video_encoder = build_mock_video_encoder(states)
     supervisor = build_supervisor(video_source, video_encoder)
 
-    supervisor.run_forever()
+    for _ in range(total_frames):
+        assert supervisor.step() is True
 
+    assert supervisor.step() is False
+    assert supervisor.state == SupervisorState.ERROR
+    assert supervisor.error is not None
     video_source.release.assert_called_once()
     assert supervisor.processed_frame_count == total_frames
 
 
-def test_supervisor_pushes_annotated_frame_and_status_to_controller() -> None:
+def test_stop_returns_to_idle_from_error() -> None:
+    """STOP is the only button offered in ERROR, so it has to work there."""
+    states = make_normal_states(1)
+    video_source = build_mock_video_source(0)  # no frames at all
+    video_encoder = build_mock_video_encoder(states)
+    supervisor = build_supervisor(video_source, video_encoder)
+
+    assert supervisor.step() is False
+    assert supervisor.state == SupervisorState.ERROR
+
+    supervisor.request_stop()
+    supervisor._drain_commands()
+
+    assert supervisor.state == SupervisorState.IDLE
+    assert supervisor.error is None
+
+
+def test_latest_frame_and_status_expose_what_a_ui_needs() -> None:
+    """Nothing is pushed anywhere: a UI pulls these two, so they must be
+    right after every frame."""
     total_frames = 3
     states = make_normal_states(total_frames)
 
-    controller = create_autospec(IController, instance=True)
     video_source = build_mock_video_source(total_frames)
     video_encoder = build_mock_video_encoder(states)
-    supervisor = build_supervisor(video_source, video_encoder, controller=controller)
+    supervisor = build_supervisor(video_source, video_encoder)
 
-    supervisor.initialize()
     for _ in range(total_frames):
         assert supervisor.step() is True
 
-    assert controller.publish_frame.call_count == total_frames
-    assert controller.publish_status.call_count == total_frames
+    # The UI must see the annotated frame, never the raw camera frame.
+    assert np.array_equal(supervisor.latest_frame, ANNOTATED_FRAME)
 
-    # The UI must receive the annotated frame, never the raw camera frame.
-    pushed_frame = controller.publish_frame.call_args[0][0]
-    assert np.array_equal(pushed_frame, ANNOTATED_FRAME)
-
-    status = controller.publish_status.call_args[0][0]
+    status = supervisor.build_status()
     assert status.state == SupervisorState.COLLECTING_DATA
     assert status.processed_frame_count == total_frames
     assert status.collected_count == total_frames
@@ -222,50 +251,129 @@ def test_supervisor_pushes_annotated_frame_and_status_to_controller() -> None:
     assert status.total_alarms == 0
 
 
-def test_supervisor_pushes_alarm_to_controller() -> None:
+def test_alarm_reaches_the_alarm_handler() -> None:
+    """The handler is the one and only way an event leaves the Supervisor."""
     outlier_index = COLLECTION_TARGET + 3
     total_frames = outlier_index + 1
 
     states = make_normal_states(total_frames)
     states[outlier_index] = make_outlier_state(states[outlier_index][0].t)
 
-    controller = create_autospec(IController, instance=True)
+    alarm_handler = create_autospec(IAlarmHandler, instance=True)
     video_source = build_mock_video_source(total_frames)
     video_encoder = build_mock_video_encoder(states)
-    supervisor = build_supervisor(video_source, video_encoder, controller=controller)
+    supervisor = build_supervisor(video_source, video_encoder, alarm_handler=alarm_handler)
 
-    supervisor.initialize()
     for _ in range(total_frames):
         assert supervisor.step() is True
 
     assert supervisor.state == SupervisorState.ALARM_ACTIVE
-    controller.publish_alarm.assert_called_once()
+    alarm_handler.trigger_alarm.assert_called_once()
 
-    event = controller.publish_alarm.call_args[0][0]
+    event = alarm_handler.trigger_alarm.call_args[0][0]
     assert event.anomaly_score < 0
     assert np.array_equal(event.frame, ANNOTATED_FRAME)
     assert supervisor.total_alarms == 1
 
 
-def test_controller_failure_does_not_break_processing_loop() -> None:
-    """A misbehaving UI must never take down the processing loop."""
-    total_frames = 3
-    states = make_normal_states(total_frames)
+def test_a_failing_alarm_sink_does_not_break_processing_loop() -> None:
+    """A misbehaving UI must never take down the processing loop.
 
-    controller = create_autospec(IController, instance=True)
-    controller.publish_status.side_effect = RuntimeError("UI exploded")
-    controller.publish_frame.side_effect = RuntimeError("UI exploded")
+    The UI is now an alarm sink like any other, and the Supervisor calls the
+    handler from inside the frame loop's try block - so the isolation has to
+    come from the composite. This is that guarantee, end to end.
+    """
+    outlier_index = COLLECTION_TARGET + 3
+    total_frames = outlier_index + 2
+
+    states = make_normal_states(total_frames)
+    states[outlier_index] = make_outlier_state(states[outlier_index][0].t)
+
+    exploding = create_autospec(IAlarmHandler, instance=True)
+    exploding.trigger_alarm.side_effect = RuntimeError("UI exploded")
+    surviving = create_autospec(IAlarmHandler, instance=True)
 
     video_source = build_mock_video_source(total_frames)
     video_encoder = build_mock_video_encoder(states)
-    supervisor = build_supervisor(video_source, video_encoder, controller=controller)
+    supervisor = build_supervisor(
+        video_source,
+        video_encoder,
+        alarm_handler=CompositeAlarmHandler([exploding, surviving]),
+    )
 
-    supervisor.initialize()
     for _ in range(total_frames):
         assert supervisor.step() is True
 
-    assert supervisor.state == SupervisorState.COLLECTING_DATA
+    # However many alarms this run raised, the sink behind the failing one
+    # heard every single one of them.
+    assert exploding.trigger_alarm.call_count >= 1
+    assert surviving.trigger_alarm.call_count == exploding.trigger_alarm.call_count
+    assert supervisor.state != SupervisorState.ERROR
     assert supervisor.processed_frame_count == total_frames
+
+
+def test_training_progress_is_reported_while_fitting() -> None:
+    """The dashboard's training bar is driven by whatever fit() reports, so
+    the Supervisor has to hand the detector a callback and keep the result."""
+    total_frames = COLLECTION_TARGET + 1
+    states = make_normal_states(total_frames)
+
+    seen: list[float] = []
+
+    class RecordingDetector(IsolationForestAnomalyDetector):
+        def fit(self, training_data, progress_callback=None):
+            super().fit(training_data)
+            for percent in (25, 50, 75):
+                progress_callback(percent)
+                # What a UI polling build_status() would read at this instant.
+                seen.append(supervisor.build_status().training_progress)
+
+    video_source = build_mock_video_source(total_frames)
+    video_encoder = build_mock_video_encoder(states)
+    supervisor = Supervisor(
+        video_source_factory=lambda camera: video_source,
+        video_encoder=video_encoder,
+        feature_encoder=DummyFeatureEncoder(),
+        anomaly_detector_factory=lambda name: RecordingDetector(contamination=0.05),
+        alarm_handler=ConsoleLoggerAlarmHandler(),
+        collection_target_value=COLLECTION_TARGET,
+    )
+    supervisor.initialize()
+    supervisor.request_start()
+    supervisor._drain_commands()
+
+    for _ in range(total_frames):
+        assert supervisor.step() is True
+
+    assert seen == [0.25, 0.50, 0.75]
+    assert supervisor.state == SupervisorState.MONITORING
+
+
+def test_a_fresh_detector_is_built_for_every_run() -> None:
+    """A run must never inherit the previous run's fitted weights."""
+    built: list[str] = []
+
+    def factory(name: str) -> IsolationForestAnomalyDetector:
+        built.append(name)
+        return IsolationForestAnomalyDetector(contamination=0.05)
+
+    supervisor = Supervisor(
+        video_source_factory=lambda camera: build_mock_video_source(1),
+        video_encoder=build_mock_video_encoder(make_normal_states(1)),
+        feature_encoder=DummyFeatureEncoder(),
+        anomaly_detector_factory=factory,
+        alarm_handler=ConsoleLoggerAlarmHandler(),
+        detector="isolation_forest",
+    )
+    supervisor.initialize()
+
+    for _ in range(2):
+        supervisor.request_start()
+        supervisor._drain_commands()
+        supervisor.request_stop()
+        supervisor._drain_commands()
+
+    assert built == ["isolation_forest", "isolation_forest"]
 
 
 if __name__ == "__main__":

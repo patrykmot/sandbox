@@ -64,6 +64,15 @@ class IVideoEncoder(ABC):
         """Process a single frame into StateVectors plus a display overlay."""
         raise NotImplementedError
 
+    def reset(self) -> None:
+        """Forget per-object history (track ids, previous positions).
+
+        Called when a scan starts, so velocities are never derived from
+        tracks belonging to an earlier run or a different camera. Not
+        abstract - a stateless encoder can ignore it.
+        """
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class FeatureVector:

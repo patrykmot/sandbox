@@ -11,7 +11,7 @@ and serves a live web dashboard while it works.
 
 ## What it does
 
-1. **Reads frames** from a camera or RTSP stream.
+1. **Reads frames** from the camera you pick in the dashboard (or an RTSP stream).
 2. **Detects and tracks objects** with YOLOv8 + ByteTrack. Each tracked object
    becomes a `StateVector`: when it was seen, where it is, how fast it moves, how
    big it is, and what class it belongs to.
@@ -33,8 +33,10 @@ and serves a live web dashboard while it works.
 
 The system moves through these states:
 
-`INITIALIZING → COLLECTING_DATA → TRAINING → MONITORING ⇄ ALARM_ACTIVE`
-(plus `ERROR` if something in the loop fails).
+`IDLE → COLLECTING_DATA → TRAINING → MONITORING ⇄ ALARM_ACTIVE`
+(plus `ERROR` if something fails). It boots into `IDLE`, previewing the selected camera
+but learning nothing, and **Stop** returns it to `IDLE` from any state — including `ERROR`,
+which is how the dashboard recovers a failed run without restarting the process.
 
 ---
 
@@ -98,11 +100,13 @@ playground/            scratch scripts, not part of the running system
 
 ```bash
 pip install -r requirements.txt
-python -m src.main            # dashboard on http://localhost:8000/
+python main.py                # dashboard on http://localhost:8000/
 ```
 
-Needs Python 3.12+ and `src/yolov8n.pt` (included). During collection the console
-shows a single updating progress bar; state changes are logged normally.
+Needs Python 3.12+ and `src/yolov8n.pt` (included). Nothing is scanned until you press
+**Start** in the dashboard: on boot the first camera found is previewed so you can see what
+it sees. During collection the console shows a single updating progress bar; state changes
+are logged normally.
 
 Everything is configured through environment variables or a `.env` file, for
 example:
@@ -124,6 +128,31 @@ settings, all with working defaults, so it starts with no configuration at all.
 | `/api/status` | current state, frames processed, collection progress, alarm count |
 | `/video_feed` | live MJPEG stream of the annotated camera view |
 | `/alerts` | the most recent alarms, newest first |
+| `/api/cameras` | the cameras you can choose from |
+| `POST /api/control/start` | begin collecting a baseline on the selected camera |
+| `POST /api/control/stop` | return to `IDLE`, discarding what was learned |
+| `POST /api/control/camera` | select a different camera (`IDLE` only) |
+| `/static/...` | the dashboard's own CSS and JS |
+
+The page needs **no internet access** — Bootstrap and jQuery are vendored under
+`src/implementations/static/vendor/` and served by the app itself, so the dashboard
+works on an isolated network where the browser can reach this server and nothing else.
+
+### Controls
+
+One button: **Start** in `IDLE`, **Stop** everywhere else. The camera dropdown is live only
+in `IDLE` — once collection begins, the camera is part of what the model learned, so
+changing it would invalidate the baseline. Stopping discards the model, the buffer and the
+tracker state, so every Start begins a fresh scan.
+
+Cameras are found by opening device indices `0..CAMERA_PROBE_MAX-1` and keeping the ones
+that answer, so they are listed as `Camera 0`, `Camera 1`, … This uses nothing but OpenCV
+and behaves the same on Windows, Linux and macOS. The camera currently in use always stays
+in the list, since many backends refuse to open the same device twice.
+
+The control endpoints have no authentication. That is fine on an isolated network with
+`SERVER_HOST` bound to one interface; think twice before exposing the dashboard to a wider
+LAN, since anyone who can load the page can stop a running scan.
 
 ### Feature CSV
 
