@@ -71,6 +71,7 @@ for another model, is a one-line change.
 | 4 | — (coordinator) | `Supervisor` — the state machine and per-frame loop |
 | 5 | `IAlarmHandler` | `ConsoleLoggerAlarmHandler` |
 | 6 | `IFeatureEncoder` | `FrameMergingFeatureEncoder` — one vector per frame |
+|   |   | `BiologicalFeatureEncoder` — the same, plus per-object slots with semantic traits (`FEATURE_ENCODER=biological`) |
 | 7 | `IController` | `WebController` — FastAPI dashboard |
 
 Dependencies point one way only: `implementations → core → interfaces`.
@@ -115,9 +116,10 @@ example:
 CAMERA_INDEX=rtsp://user:pass@host/stream   # a stream or video file instead of the webcam
 COLLECTION_TARGET_VALUE=200                 # a shorter baseline while developing
 SERVER_PORT=8080                            # dashboard port
+FEATURE_ENCODER=biological                  # add per-object trait slots to each frame vector
 ```
 
-See `src/config.py` for the full list — camera, dashboard, YOLO, detector and CSV
+See `src/config.py` for the full list — camera, dashboard, YOLO, feature encoder, detector and CSV
 settings, all with working defaults, so it starts with no configuration at all.
 
 ### Dashboard
