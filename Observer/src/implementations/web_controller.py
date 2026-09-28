@@ -136,7 +136,7 @@ class WebController(IAlarmHandler):
 
     def run(self) -> None:
         """Block serving the dashboard (main thread)."""
-        uvicorn.run(self.app, host=self._host, port=self._port, log_level="info")
+        uvicorn.run(self.app, host=self._host, port=self._port, log_level="warning")
 
     # --- Helpers ----------------------------------------------------------------------
 

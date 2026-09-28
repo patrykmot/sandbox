@@ -93,8 +93,8 @@ class Config(BaseSettings):
     dashboard_jpeg_quality: int = 80
 
     # --- Video encoder (YOLO) -------------------------------------------------------
-    yolo_model_path: str = "yolov8n.pt"
-    yolo_confidence: float = 0.51
+    yolo_model_path: str = "yolov8s.pt" # Size (from smallest)-> YOLO26n, YOLO26s, YOLO26m, YOLO26l, YOLO26x
+    yolo_confidence: float = 0.50
     yolo_tracker: str = "bytetrack.yaml"
 
     # --- Anomaly detector ------------------------------------------------------------
@@ -106,14 +106,14 @@ class Config(BaseSettings):
     isolation_training_coverage_percent: float = 95.0
     model_save_path: str = "models/isolation_forest.joblib"
 
-    autoencoder_hidden_dim: int = 32
-    autoencoder_latent_dim: int = 8
+    autoencoder_hidden_dim: int = 48
+    autoencoder_latent_dim: int = 12
     """Bottleneck width. Narrower forces the model to generalise harder, so
     unusual frames reconstruct worse - but too narrow and normal ones do too."""
-    autoencoder_epochs: int = 50
+    autoencoder_epochs: int = 100
     autoencoder_batch_size: int = 32
     autoencoder_learning_rate: float = 1e-3
-    autoencoder_percentile_threshold: float = 0.99
+    autoencoder_percentile_threshold: float = 0.999
     """Where the alarm line sits, as a FRACTION: 0.99 means "the error 99% of
     training frames stayed below". Lower it to catch more and alarm more."""
 
