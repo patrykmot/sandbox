@@ -1,13 +1,10 @@
-"""IFeatureEncoder that fuses global frame statistics with per-object slots.
+"""IFeatureEncoder that describes a frame as fixed per-object slots.
 
-FrameMergingFeatureEncoder squeezes a whole frame into percentiles: good at
-describing the crowd, blind to *who* is in it - a dog and a bus of the same
-size moving at the same speed are indistinguishable there. This encoder keeps
-that global vector untouched and appends a fixed number of object "slots",
-one per largest object, each carrying that object's raw physics plus a
-multi-hot description of what kind of thing it is:
+Each frame becomes a fixed number of object "slots", one per largest object,
+each carrying that object's raw physics plus a multi-hot description of what
+kind of thing it is:
 
-    [ global stats (17) | slot 0 | slot 1 | ... | slot MAX_OBJECTS-1 ]
+    [ slot 0 | slot 1 | ... | slot MAX_OBJECTS-1 ]
 
     slot = [is_present, x, y, vx, vy, size, trait_1, ..., trait_K]
 
@@ -29,16 +26,16 @@ model that the rest of the slot is padding rather than an object sitting at
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Iterable, Mapping
 
 import numpy as np
 
-from src.implementations.frame_merging_feature_encoder import FrameMergingFeatureEncoder
-from src.interfaces.encoder import FeatureVector, StateVector
+from src.interfaces.encoder import FeatureVector, IFeatureEncoder, StateVector
 
 
-class BiologicalFeatureEncoder(FrameMergingFeatureEncoder):
-    """FrameMergingFeatureEncoder + per-object slots for the N largest objects."""
+class BiologicalFeatureEncoder(IFeatureEncoder):
+    """Groups StateVectors by timestamp; one slot per largest object in each group."""
 
     #: Per-slot kinematic columns, in vector order. Trait columns follow.
     SLOT_BASE_FIELDS: tuple[str, ...] = ("present", "x", "y", "vx", "vy", "size")
@@ -81,7 +78,7 @@ class BiologicalFeatureEncoder(FrameMergingFeatureEncoder):
                 *(f"trait_{name.lower()}" for name in self._trait_names),
             )
         )
-        self.FEATURE_NAMES: tuple[str, ...] = FrameMergingFeatureEncoder.FEATURE_NAMES + slot_names
+        self.FEATURE_NAMES: tuple[str, ...] = slot_names
         self.FEATURE_DIM: int = len(self.FEATURE_NAMES)
 
     @property
@@ -104,11 +101,22 @@ class BiologicalFeatureEncoder(FrameMergingFeatureEncoder):
             dtype=np.float64,
         )
 
+    def encode(self, states: list[StateVector]) -> list[FeatureVector]:
+        """One FeatureVector per same-timestamp group, ordered by timestamp.
+
+        Sorting makes the output deterministic regardless of input order. In
+        the live pipeline a call holds one frame, so this returns a single
+        FeatureVector; grouping matters for batch/offline use.
+        """
+        groups: dict[int, list[StateVector]] = defaultdict(list)
+        for state in states:
+            groups[state.t].append(state)
+
+        return [self._encode_group(t, groups[t]) for t in sorted(groups)]
+
     # --- Internals --------------------------------------------------------------------
 
     def _encode_group(self, t: int, group: list[StateVector]) -> FeatureVector:
-        base = super()._encode_group(t, group)
-
         # Largest first. Ties are broken by position so the slot order does
         # not depend on the order the tracker happened to report objects in.
         largest = sorted(group, key=lambda s: (-s.size, s.x, s.y))[: self._max_objects]
@@ -121,4 +129,4 @@ class BiologicalFeatureEncoder(FrameMergingFeatureEncoder):
             row[:n_base] = (1.0, state.x, state.y, state.vx, state.vy, state.size)
             row[n_base:] = self.traits_of(state.object_type)
 
-        return FeatureVector(t=t, vector=np.concatenate([base.vector, slots.ravel()]))
+        return FeatureVector(t=t, vector=slots.ravel())

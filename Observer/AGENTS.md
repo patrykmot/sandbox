@@ -125,3 +125,4 @@ class) with a default and a docstring, not scattered `os.environ` reads.
 - If you made an architectural judgment call instead of asking, say so
   explicitly when reporting back, so it can be reviewed rather than silently
   accepted.
+- It's NOT ok if any test is failing before you started coding. You need to rise this. 
