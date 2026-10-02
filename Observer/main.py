@@ -21,9 +21,10 @@ from __future__ import annotations
 import logging
 import threading
 
-from src.config import Config
+from src.config import Config, DetectorKind, FeatureEncoderKind
 from src.core.supervisor import Supervisor
 from src.implementations.autoencoder_detector import PyTorchAutoencoderDetector
+from src.implementations.biological_feature_encoder import BiologicalFeatureEncoder
 from src.implementations.camera_list import list_cameras
 from src.implementations.camera_source import CameraVideoSource
 from src.implementations.composite_alarm import CompositeAlarmHandler
@@ -35,6 +36,7 @@ from src.implementations.web_controller import WebController
 from src.implementations.yolo_encoder import YOLOVideoEncoder
 from src.interfaces.alarm import IAlarmHandler
 from src.interfaces.detector import DetectorOption, IAnomalyDetector
+from src.interfaces.encoder import IFeatureEncoder
 from src.interfaces.video_source import CameraOption, IVideoSource
 
 logger = logging.getLogger(__name__)
@@ -44,17 +46,45 @@ logger = logging.getLogger(__name__)
 # place that maps a dashboard dropdown entry to a constructor - add an
 # implementation of IAnomalyDetector here and it appears in the UI. The
 # operator picks one per run, so these are built on START rather than now.
-DETECTORS: dict[str, str] = {
-    "isolation_forest": "Isolation Forest (scikit-learn)",
-    "autoencoder": "Autoencoder (PyTorch)",
+DETECTORS: dict[DetectorKind, str] = {
+    DetectorKind.ISOLATION_FOREST: "Isolation Forest (scikit-learn)",
+    DetectorKind.AUTOENCODER: "Autoencoder (PyTorch)",
 }
+
+
+# Component 6: the selectable Feature Encoders, chosen once at startup by
+# Config.feature_encoder. Unlike the detector this is not a dashboard choice:
+# the encoder fixes the vector width, so it is fixed for the process.
+FEATURE_ENCODERS: dict[FeatureEncoderKind, str] = {
+    FeatureEncoderKind.FRAME_MERGING: "Frame merging - global frame statistics",
+    FeatureEncoderKind.BIOLOGICAL: "Biological - global statistics + per-object trait slots",
+}
+
+
+def build_feature_encoder(config: Config) -> IFeatureEncoder:
+    """Builds the feature encoder named by Config.feature_encoder.
+
+    Config already rejects an unknown FEATURE_ENCODER; the final raise only
+    guards against a FeatureEncoderKind member added without a branch here,
+    so a new id never silently trains on a different feature set.
+    """
+    if config.feature_encoder is FeatureEncoderKind.FRAME_MERGING:
+        return FrameMergingFeatureEncoder()
+    if config.feature_encoder is FeatureEncoderKind.BIOLOGICAL:
+        return BiologicalFeatureEncoder(
+            traits=config.biological_object_traits,
+            max_objects=config.biological_max_objects,
+        )
+    raise ValueError(
+        f"Unknown feature encoder {config.feature_encoder!r}. Known: {sorted(k.value for k in FEATURE_ENCODERS)}."
+    )
 
 
 def build_detectors_provider(config: Config):
     """Returns the callable the dashboard uses to fill its detector dropdown."""
 
     def provider() -> list[DetectorOption]:
-        return [DetectorOption(id=key, name=name) for key, name in DETECTORS.items()]
+        return [DetectorOption(id=kind.value, name=name) for kind, name in DETECTORS.items()]
 
     return provider
 
@@ -68,12 +98,20 @@ def build_detector_factory(config: Config):
     """
 
     def factory(detector: str) -> IAnomalyDetector:
-        if detector == "isolation_forest":
+        # The Supervisor and dashboard deal in plain id strings (core must not
+        # know this enum); turn it back into a DetectorKind here, at the edge.
+        try:
+            kind = DetectorKind(detector)
+        except ValueError:
+            raise ValueError(
+                f"Unknown detector {detector!r}. Known: {sorted(k.value for k in DETECTORS)}."
+            ) from None
+        if kind is DetectorKind.ISOLATION_FOREST:
             return IsolationForestAnomalyDetector(
                 contamination=config.isolation_forest_contamination,
                 n_tree_training_coverage_percent=config.isolation_training_coverage_percent,
             )
-        if detector == "autoencoder":
+        if kind is DetectorKind.AUTOENCODER:
             return PyTorchAutoencoderDetector(
                 hidden_dim=config.autoencoder_hidden_dim,
                 latent_dim=config.autoencoder_latent_dim,
@@ -82,7 +120,7 @@ def build_detector_factory(config: Config):
                 learning_rate=config.autoencoder_learning_rate,
                 percentile_threshold=config.autoencoder_percentile_threshold,
             )
-        raise ValueError(f"Unknown detector {detector!r}. Known: {sorted(DETECTORS)}.")
+        raise ValueError(f"Unknown detector {detector!r}. Known: {sorted(k.value for k in DETECTORS)}.")
 
     return factory
 
@@ -120,11 +158,16 @@ def build_supervisor(config: Config, alarm_handler: IAlarmHandler) -> Supervisor
         tracker=config.yolo_tracker,
     )
 
-    # Component 6: Feature Encoder. FrameMergingFeatureEncoder merges all
-    # objects sharing a timestamp into ONE 17-feature vector per frame, so
-    # object-to-object relations are what the detector learns. Swap in
-    # DummyFeatureEncoder here for one vector per object instead.
-    feature_encoder = FrameMergingFeatureEncoder()
+    # Component 6: Feature Encoder, selected by Config.feature_encoder (see
+    # FEATURE_ENCODERS). Both merge all objects sharing a timestamp into ONE
+    # vector per frame, so object-to-object relations are what the detector
+    # learns; "biological" additionally appends per-object trait slots.
+    feature_encoder = build_feature_encoder(config)
+    logger.info(
+        "Feature encoder: %s (%d features).",
+        config.feature_encoder.value,
+        getattr(feature_encoder, "FEATURE_DIM", -1),
+    )
 
     # Optional observation side channel: dumps every FeatureVector to CSV.
     # Column names are taken from the encoder when it publishes them.
@@ -145,7 +188,7 @@ def build_supervisor(config: Config, alarm_handler: IAlarmHandler) -> Supervisor
         collection_target_value=config.collection_target_value,
         feature_csv_writer=feature_csv_writer,
         camera=default_camera(config),
-        detector=config.default_detector,
+        detector=config.default_detector.value,
     )
 
 
