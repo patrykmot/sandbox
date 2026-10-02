@@ -98,13 +98,43 @@ def test_predict_before_fit_is_an_error_not_a_guess() -> None:
         PyTorchAutoencoderDetector().predict(make_outlier_frame())
 
 
-def test_percentile_threshold_must_be_a_fraction() -> None:
-    """99 instead of 0.99 would put the line near the *minimum* error and
-    flag every frame. Refuse it rather than detect everything."""
+def test_error_threshold_percentage_must_be_positive() -> None:
+    """A zero or negative line would flag every frame. Refuse it."""
     with pytest.raises(ValueError):
-        PyTorchAutoencoderDetector(percentile_threshold=99)
+        PyTorchAutoencoderDetector(error_threshold_percentage=0.0)
     with pytest.raises(ValueError):
-        PyTorchAutoencoderDetector(percentile_threshold=0.0)
+        PyTorchAutoencoderDetector(error_threshold_percentage=-10.0)
+
+
+def test_threshold_is_percentage_of_max_training_error() -> None:
+    """max error 5.0 at 110% must give 5.5 - the percentage scales the worst
+    training error, it is not a percentile."""
+    import torch
+
+    detector = PyTorchAutoencoderDetector(error_threshold_percentage=110.0)
+    detector._errors = lambda x: torch.tensor([1.0, 5.0, 2.0])  # type: ignore[method-assign]
+
+    assert detector._compute_threshold(torch.zeros(3, 1)) == pytest.approx(5.5)
+
+
+def test_at_100_percent_no_training_sample_is_flagged() -> None:
+    """At 100% the line is the worst training error, so no training frame
+    may score meaningfully above it. Scoring one frame alone vs. in the
+    training batch can differ in the last float32 bits, hence the tolerance
+    rather than a strict `not is_anomaly`."""
+    frames = make_normal_frames(200)
+    detector = PyTorchAutoencoderDetector(epochs=60, error_threshold_percentage=100.0)
+    detector.fit(frames)
+
+    worst = max(detector.predict(frame)[1] for frame in frames)
+    assert worst <= detector.maximum_normal_error * (1 + 1e-4)
+
+
+def test_a_higher_percentage_raises_the_line_proportionally() -> None:
+    base = train_detector(error_threshold_percentage=100.0)
+    relaxed = train_detector(error_threshold_percentage=150.0)
+
+    assert relaxed.maximum_normal_error == pytest.approx(base.maximum_normal_error * 1.5)
 
 
 def test_progress_callback_climbs_to_100() -> None:
@@ -143,7 +173,7 @@ def test_normal_frames_are_not_flagged() -> None:
         detector.predict(frame)[0] for frame in make_normal_frames(30, seed=99)
     ]
 
-    # The threshold is the 99th percentile of training error, so an occasional
+    # The threshold is the worst training error, so an occasional unseen
     # normal frame landing above it is expected - a majority doing so is not.
     assert sum(flagged) <= 3, f"{sum(flagged)}/30 normal frames flagged"
 

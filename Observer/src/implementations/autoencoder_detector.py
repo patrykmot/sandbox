@@ -9,12 +9,16 @@ rebuilding normal scenes and bad at rebuilding anything else - so the
 to put the line.
 
 That line is learned, not guessed: after training, every training sample is
-run back through the model and `maximum_normal_error` is taken as a high
-percentile of the resulting errors. The percentile (rather than the maximum)
-is what keeps a handful of odd training frames from setting the bar so high
-that nothing ever trips it.
+run back through the model, the largest of the resulting errors is taken as
+the baseline, and `maximum_normal_error` is that baseline scaled by
+`error_threshold_percentage` (100.0 = 100%):
 
+    maximum_normal_error = max(error_per_sample) * error_threshold_percentage / 100
     is_anomaly = output_error > maximum_normal_error
+
+Going above 100% adds headroom on top of the worst normal error seen in
+training, making the detector deliberately less sensitive - e.g. a worst
+training error of 5.0 at 110.0% gives a line at 5.5.
 
 Standardization
 ---------------
@@ -91,24 +95,24 @@ class PyTorchAutoencoderDetector(IAnomalyDetector):
         epochs: int = 50,
         batch_size: int = 32,
         learning_rate: float = 1e-3,
-        percentile_threshold: float = 0.99,
+        error_threshold_percentage: float = 100.0,
         random_state: int = 42,
     ) -> None:
         """
         Args:
-            percentile_threshold: Where to draw the line, as a FRACTION
-                between 0 and 1 (0.95-0.99 is the usual range). 0.99 means
-                "the error 99% of training samples stayed below". Passing a
-                0-100 percentile here is a common slip and raises rather than
-                silently thresholding near the minimum, which would make
-                every frame an anomaly.
+            error_threshold_percentage: Where to draw the line, as a
+                percentage of the largest per-sample training error (100.0
+                means exactly that error, 110.0 means 10% above it). Values
+                above 100 make the detector less sensitive. Must be > 0; a
+                fraction like 1.1 is accepted but means 1.1%, which would flag
+                almost everything.
             random_state: Seeds torch so a given training set gives the same
                 model twice.
         """
-        if not 0.0 < percentile_threshold <= 1.0:
+        if not error_threshold_percentage > 0.0:
             raise ValueError(
-                "percentile_threshold is a fraction in (0, 1] - e.g. 0.99 for the "
-                f"99th percentile, not 99. Got {percentile_threshold!r}."
+                "error_threshold_percentage must be a positive percentage - e.g. "
+                f"110.0 for 110%. Got {error_threshold_percentage!r}."
             )
 
         self._hidden_dim = hidden_dim
@@ -116,7 +120,7 @@ class PyTorchAutoencoderDetector(IAnomalyDetector):
         self._epochs = epochs
         self._batch_size = batch_size
         self._learning_rate = learning_rate
-        self._percentile_threshold = percentile_threshold
+        self._error_threshold_percentage = error_threshold_percentage
         self._random_state = random_state
 
         # CPU on purpose: this targets an edge box with no guaranteed GPU, and
@@ -189,9 +193,9 @@ class PyTorchAutoencoderDetector(IAnomalyDetector):
         self._print_progress(100, final=True)
         self._report(progress_callback, 100)
         logger.info(
-            "Autoencoder trained. maximum_normal_error = %.6f (%.0fth percentile).",
+            "Autoencoder trained. maximum_normal_error = %.6f (%.1f%% of max training error).",
             self.maximum_normal_error,
-            self._percentile_threshold * 100,
+            self._error_threshold_percentage,
         )
 
     def _fit_standardizer(self, x_raw: np.ndarray) -> torch.Tensor:
@@ -211,10 +215,15 @@ class PyTorchAutoencoderDetector(IAnomalyDetector):
         return (x - self._mean) / self._std
 
     def _compute_threshold(self, x: torch.Tensor) -> float:
-        """The error the training set stayed below, at the configured percentile."""
+        """The worst training error, scaled by error_threshold_percentage.
+
+        The maximum is the baseline so that every frame the
+        model was trained on scores as normal at 100%; headroom above that is
+        an explicit, tunable choice rather than a side effect of a percentile.
+        """
         error_per_sample = self._errors(x).numpy()
         return float(
-            np.percentile(error_per_sample, self._percentile_threshold * 100)
+            np.max(error_per_sample) * self._error_threshold_percentage / 100.0
         )
 
     def _errors(self, x: torch.Tensor) -> torch.Tensor:

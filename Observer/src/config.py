@@ -113,9 +113,10 @@ class Config(BaseSettings):
     autoencoder_epochs: int = 100
     autoencoder_batch_size: int = 32
     autoencoder_learning_rate: float = 1e-3
-    autoencoder_percentile_threshold: float = 0.999
-    """Where the alarm line sits, as a FRACTION: 0.99 means "the error 99% of
-    training frames stayed below". Lower it to catch more and alarm more."""
+    autoencoder_error_threshold_percentage: float = 100.0
+    """Where the alarm line sits, as a PERCENTAGE of the largest reconstruction
+    error seen in training: 100.0 is exactly that error, 110.0 is 10% above it.
+    Raise it to make the detector less sensitive; lower it to alarm more."""
 
     # --- Feature encoder -------------------------------------------------------------
     feature_encoder: FeatureEncoderKind = FeatureEncoderKind.BIOLOGICAL
