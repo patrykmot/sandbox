@@ -11,6 +11,10 @@ and serves a live web dashboard while it works.
 
 ## What it does
 
+![General info](Documents/Slide%201.png)
+![Detailed architecture](Documents/Slide%202.png)
+
+
 1. **Reads frames** from the camera you pick in the dashboard (or an RTSP stream).
 2. **Detects and tracks objects** with YOLOv8 + ByteTrack. Each tracked object
    becomes a `StateVector`: when it was seen, where it is, how fast it moves, how
