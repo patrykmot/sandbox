@@ -1,9 +1,7 @@
 """Tests for BiologicalFeatureEncoder.
 
-The encoder is FrameMergingFeatureEncoder's vector with object slots glued on
-the end, so the tests check the two halves separately: the global part must
-be exactly what the parent produces, and the slot part is checked by hand
-with the default trait table from src.config.
+The encoder's vector is nothing but object slots (no frame-level stats), so
+the slots are checked by hand with the default trait table from src.config.
 
 Run the walkthrough:
 
@@ -25,7 +23,6 @@ from src.interfaces.encoder import StateVector
 T1 = 1_700_000_000_000
 T2 = 1_700_000_000_033
 
-BASE_DIM = FrameMergingFeatureEncoder.FEATURE_DIM  # 17
 SLOT_DIM = 16  # present, x, y, vx, vy, size + 10 traits
 
 # COCO ids: 0 = person, 2 = car, 16 = dog, 56 = chair.
@@ -39,8 +36,8 @@ def make_encoder(max_objects: int = 5) -> BiologicalFeatureEncoder:
 
 
 def slots_of(vector: np.ndarray, encoder: BiologicalFeatureEncoder) -> np.ndarray:
-    """The appended part of the vector, one row per slot."""
-    return vector[BASE_DIM:].reshape(encoder.max_objects, encoder.slot_dim)
+    """The vector reshaped to one row per slot."""
+    return vector.reshape(encoder.max_objects, encoder.slot_dim)
 
 
 def traits(*names: str) -> list[float]:
@@ -52,25 +49,23 @@ def test_dimensions_with_default_config() -> None:
     encoder = make_encoder()
 
     assert encoder.slot_dim == SLOT_DIM
-    assert encoder.FEATURE_DIM == BASE_DIM + 5 * SLOT_DIM == 97
+    assert encoder.FEATURE_DIM == 5 * SLOT_DIM == 80
     assert len(encoder.FEATURE_NAMES) == encoder.FEATURE_DIM
     assert len(set(encoder.FEATURE_NAMES)) == encoder.FEATURE_DIM  # no duplicates
-    assert encoder.FEATURE_NAMES[:BASE_DIM] == FrameMergingFeatureEncoder.FEATURE_NAMES
-    assert encoder.FEATURE_NAMES[BASE_DIM : BASE_DIM + 7] == (
+    assert encoder.FEATURE_NAMES[:7] == (
         "obj0_present", "obj0_x", "obj0_y", "obj0_vx", "obj0_vy", "obj0_size", "obj0_trait_biological",
     )
     assert encoder.FEATURE_NAMES[-1] == "obj4_trait_handheld"
 
-    # The parent's class-level names are untouched by the instance override.
-    assert FrameMergingFeatureEncoder.FEATURE_DIM == 17
 
+def test_vector_is_slots_only_with_no_frame_level_stats() -> None:
+    """Disconnected from FrameMergingFeatureEncoder: no global columns."""
+    encoder = make_encoder()
+    vector = encoder.encode([PERSON, CAR, DOG])[0].vector
 
-def test_global_part_is_exactly_the_parent_vector() -> None:
-    parent = FrameMergingFeatureEncoder().encode([PERSON, CAR, DOG])[0].vector
-    enriched = make_encoder().encode([PERSON, CAR, DOG])[0].vector
-
-    assert enriched.shape == (97,)
-    np.testing.assert_array_equal(enriched[:BASE_DIM], parent)
+    assert vector.shape == (80,)
+    assert all(name.startswith("obj") for name in encoder.FEATURE_NAMES)
+    assert not isinstance(encoder, FrameMergingFeatureEncoder)
 
 
 def test_slots_are_sorted_by_size_descending_and_padded_with_zeros() -> None:
@@ -97,8 +92,6 @@ def test_more_objects_than_slots_keeps_only_the_largest() -> None:
 
     assert slots.shape == (2, SLOT_DIM)
     assert slots[:, 5].tolist() == [5_000.0, 300.0]  # dog (150) dropped
-    # ...but the global part still counts all three.
-    assert encoder.encode([DOG, PERSON, CAR])[0].vector[0] == 3.0
 
 
 def test_multi_hot_traits_for_selected_classes() -> None:
@@ -127,7 +120,7 @@ def test_equal_sizes_give_the_same_slots_whatever_the_input_order() -> None:
     np.testing.assert_array_equal(encoder.encode([a, b])[0].vector, encoder.encode([b, a])[0].vector)
 
 
-def test_groups_by_timestamp_like_the_parent() -> None:
+def test_groups_by_timestamp_in_order() -> None:
     later = StateVector(t=T2, x=5.0, y=5.0, vx=0.0, vy=0.0, size=10.0, object_type=56)
     encoder = make_encoder()
 
@@ -142,7 +135,7 @@ def test_trait_table_and_slot_count_come_from_configuration() -> None:
     encoder = BiologicalFeatureEncoder(traits={"ALIVE": [0, 16], "CAR": [2]}, max_objects=3)
 
     assert encoder.slot_dim == 8
-    assert encoder.FEATURE_DIM == BASE_DIM + 3 * 8
+    assert encoder.FEATURE_DIM == 3 * 8
     slots = slots_of(encoder.encode([CAR, DOG])[0].vector, encoder)
     assert slots[0, 6:].tolist() == [0.0, 1.0]
     assert slots[1, 6:].tolist() == [1.0, 0.0]
@@ -181,12 +174,6 @@ def test_feature_encoder_setting_accepts_env_strings_and_rejects_unknown_ids(
         Config()
 
 
-def test_default_config_keeps_the_existing_encoder() -> None:
-    assert Config().feature_encoder is FeatureEncoderKind.FRAME_MERGING
-    assert Config().biological_max_objects == 5
-    assert Config().biological_object_traits == DEFAULT_OBJECT_TRAITS
-
-
 def test_all_features_finite_so_isolation_forest_accepts_them() -> None:
     encoder = make_encoder()
     frames = []
@@ -209,8 +196,8 @@ def test_walkthrough_print() -> None:
     encoder = make_encoder()
     vector = encoder.encode([PERSON, CAR, DOG])[0].vector
 
-    print("\n--- BiologicalFeatureEncoder: object slots (global part as in FrameMerging) ---")
-    for name, value in zip(encoder.FEATURE_NAMES[BASE_DIM:], vector[BASE_DIM:]):
+    print("\n--- BiologicalFeatureEncoder: object slots ---")
+    for name, value in zip(encoder.FEATURE_NAMES, vector):
         if not name.startswith(("obj3_", "obj4_")):
             print(f"  {name:<28} = {value:>10.2f}")
 

@@ -118,7 +118,7 @@ def build_detector_factory(config: Config):
                 epochs=config.autoencoder_epochs,
                 batch_size=config.autoencoder_batch_size,
                 learning_rate=config.autoencoder_learning_rate,
-                percentile_threshold=config.autoencoder_percentile_threshold,
+                error_threshold_percentage=config.autoencoder_error_threshold_percentage,
             )
         raise ValueError(f"Unknown detector {detector!r}. Known: {sorted(k.value for k in DETECTORS)}.")
 
