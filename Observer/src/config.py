@@ -110,7 +110,7 @@ class Config(BaseSettings):
     autoencoder_latent_dim: int = 12
     """Bottleneck width. Narrower forces the model to generalise harder, so
     unusual frames reconstruct worse - but too narrow and normal ones do too."""
-    autoencoder_epochs: int = 100
+    autoencoder_epochs: int = 40
     autoencoder_batch_size: int = 32
     autoencoder_learning_rate: float = 1e-3
     autoencoder_error_threshold_percentage: float = 101.0
